@@ -1,288 +1,458 @@
-'use client'
-import { useState, useCallback, useEffect, useRef } from 'react';
+'use client';
+
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
-import { useAccount, useSendTransaction, useWaitForTransactionReceipt, useBalance } from 'wagmi';
-import { parseEther } from 'viem';
-import { ConnectWallet } from '@coinbase/onchainkit/wallet';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
-import type { Address } from 'viem';
-import { sdk } from "@farcaster/miniapp-sdk";
-import { useAddMiniApp } from "@/hooks/useAddMiniApp";
-import { useQuickAuth } from "@/hooks/useQuickAuth";
-import { useIsInFarcaster } from "@/hooks/useIsInFarcaster";
+import { ArrowLeftRight, Coins, Play, RotateCcw, Trophy, Home as HomeIcon, Zap } from 'lucide-react';
+import WalletButton from '@/components/WalletButton';
+import SwapModal from '@/components/SwapModal';
+import PowerUpShop, { useEthPowerUpPurchase } from '@/components/PowerUpShop';
+import {
+  POWERUPS,
+  EMPTY_INVENTORY,
+  type PowerUpId,
+  type PowerUpInventory,
+} from '@/lib/powerups';
 
 const Game2D = dynamic(() => import('@/components/Game2D'), { ssr: false });
 
-const GAME_RECIPIENT: Address = '0xAc6a5B8054A864Caa71A766B0a18A7382367a798';
-const POWER_UP_COST = '0.00001';
+const COINS_STORAGE = 'jumparun:coins';
+const INVENTORY_STORAGE = 'jumparun:inventory';
+const HIGHSCORE_STORAGE = 'jumparun:highscore';
+
+type View = 'home' | 'playing' | 'gameover';
 
 export default function Home() {
-    const { addMiniApp } = useAddMiniApp();
-    const isInFarcaster = useIsInFarcaster()
-    useQuickAuth(isInFarcaster)
-    useEffect(() => {
-      const tryAddMiniApp = async () => {
-        try {
-          await addMiniApp()
-        } catch (error) {
-          console.error('Failed to add mini app:', error)
-        }
+  const [view, setView] = useState<View>('home');
+  const [paused, setPaused] = useState(false);
+  const [score, setScore] = useState(0);
+  const [highScore, setHighScore] = useState(0);
+  const [coinBank, setCoinBank] = useState(0);
+  const [runCoins, setRunCoins] = useState(0);
+  const [inventory, setInventory] = useState<PowerUpInventory>(EMPTY_INVENTORY);
+  const [swapOpen, setSwapOpen] = useState(false);
 
-      }
-
-    
-
-      tryAddMiniApp()
-    }, [addMiniApp])
-    useEffect(() => {
-      const initializeFarcaster = async () => {
-        try {
-          await new Promise(resolve => setTimeout(resolve, 100))
-          
-          if (document.readyState !== 'complete') {
-            await new Promise<void>(resolve => {
-              if (document.readyState === 'complete') {
-                resolve()
-              } else {
-                window.addEventListener('load', () => resolve(), { once: true })
-              }
-
-            })
-          }
-
-    
-
-          await sdk.actions.ready()
-          console.log('Farcaster SDK initialized successfully - app fully loaded')
-        } catch (error) {
-          console.error('Failed to initialize Farcaster SDK:', error)
-          
-          setTimeout(async () => {
-            try {
-              await sdk.actions.ready()
-              console.log('Farcaster SDK initialized on retry')
-            } catch (retryError) {
-              console.error('Farcaster SDK retry failed:', retryError)
-            }
-
-          }, 1000)
-        }
-
-      }
-
-    
-
-      initializeFarcaster()
-    }, [])
-  const [isPlaying, setIsPlaying] = useState<boolean>(false);
-  const [score, setScore] = useState<number>(0);
-  const [highScore, setHighScore] = useState<number>(0);
-  const [autoJumpActive, setAutoJumpActive] = useState<boolean>(false);
-  const [autoJumpRemaining, setAutoJumpRemaining] = useState<number>(0);
-  const processedTxHash = useRef<string | null>(null);
-  const [showGameOver, setShowGameOver] = useState<boolean>(false);
-  const [isPurchasing, setIsPurchasing] = useState<boolean>(false);
-
-  const { address, isConnected } = useAccount();
-  const { data: balance } = useBalance({
-    address: address,
-  });
-  const { sendTransaction, data: hash, error } = useSendTransaction();
-  const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({
-    hash,
-  });
-
-  const handleGameOver = useCallback((finalScore: number) => {
-    setIsPlaying(false);
-    setShowGameOver(true);
-    if (finalScore > highScore) {
-      setHighScore(finalScore);
-    }
-  }, [highScore]);
-
-  const handleScoreUpdate = useCallback((currentScore: number) => {
-    setScore(currentScore);
-  }, []);
-
-  const handleAutoJumpExpired = useCallback(() => {
-    setAutoJumpActive(false);
-    setAutoJumpRemaining(0);
-  }, []);
-
-  const handleAutoJumpUsed = useCallback(() => {
-    setAutoJumpRemaining(prev => {
-      const newRemaining = Math.max(0, prev - 1);
-      return newRemaining;
-    });
-  }, []);
-
-  const startGame = (): void => {
-    setIsPlaying(true);
-    setScore(0);
-    setShowGameOver(false);
-  };
-
-  const purchasePowerUp = async (): Promise<void> => {
-    if (!isConnected || !address) {
-      alert('Please connect your wallet first');
-      return;
-    }
-
-    // Check balance before attempting purchase
-    if (!balance || balance.value < parseEther(POWER_UP_COST)) {
-      const requiredETH = POWER_UP_COST;
-      const currentETH = balance ? (Number(balance.value) / 1e18).toFixed(6) : '0';
-      alert(`Insufficient balance!\n\nRequired: ${requiredETH} ETH\nYour balance: ${currentETH} ETH\n\nPlease add more ETH to your wallet on Base network.`);
-      return;
-    }
-
-    setIsPurchasing(true);
-
+  // Load saved state
+  useEffect(() => {
     try {
-      sendTransaction({
-        to: GAME_RECIPIENT,
-        value: parseEther(POWER_UP_COST),
-      });
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : 'Transaction failed';
-      console.error('Purchase error:', errorMessage);
-      alert(`Purchase failed: ${errorMessage}`);
-      setIsPurchasing(false);
+      const c = Number(localStorage.getItem(COINS_STORAGE) ?? '0');
+      if (!Number.isNaN(c)) setCoinBank(c);
+      const hs = Number(localStorage.getItem(HIGHSCORE_STORAGE) ?? '0');
+      if (!Number.isNaN(hs)) setHighScore(hs);
+      const inv = localStorage.getItem(INVENTORY_STORAGE);
+      if (inv) setInventory({ ...EMPTY_INVENTORY, ...JSON.parse(inv) });
+    } catch {
+      /* ignore */
     }
-  };
+  }, []);
 
-  // Handle transaction confirmation - only trigger once per transaction
-  useEffect(() => {
-    if (isConfirmed && hash && processedTxHash.current !== hash) {
-      processedTxHash.current = hash; // Mark this transaction as processed
-      setAutoJumpActive(true);
-      setAutoJumpRemaining(10);
-      setIsPurchasing(false);
-      alert('Auto-Jump Power-Up Activated! 🚀\n10 auto-jumps ready!');
+  const persistCoins = useCallback((v: number) => {
+    setCoinBank(v);
+    try {
+      localStorage.setItem(COINS_STORAGE, String(v));
+    } catch {
+      /* ignore */
     }
-  }, [isConfirmed, hash]);
+  }, []);
 
-  // Handle transaction errors
-  useEffect(() => {
-    if (error && isPurchasing) {
-      console.error('Transaction error:', error);
-      alert(`Transaction failed: ${error.message}`);
-      setIsPurchasing(false);
+  const persistInventory = useCallback((inv: PowerUpInventory) => {
+    setInventory(inv);
+    try {
+      localStorage.setItem(INVENTORY_STORAGE, JSON.stringify(inv));
+    } catch {
+      /* ignore */
     }
-  }, [error, isPurchasing]);
+  }, []);
+
+  const persistHighScore = useCallback((hs: number) => {
+    setHighScore(hs);
+    try {
+      localStorage.setItem(HIGHSCORE_STORAGE, String(hs));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const handleGameOver = useCallback(
+    (finalScore: number, coinsFromRun: number) => {
+      const newCoins = coinBank + coinsFromRun;
+      persistCoins(newCoins);
+      if (finalScore > highScore) persistHighScore(finalScore);
+      setView('gameover');
+      setPaused(false);
+    },
+    [coinBank, highScore, persistCoins, persistHighScore],
+  );
+
+  const handleScoreUpdate = useCallback((s: number) => setScore(s), []);
+  const handleCoinCollected = useCallback((total: number) => setRunCoins(total), []);
+
+  const handleConsumePowerUp = useCallback(
+    (id: PowerUpId) => {
+      persistInventory({ ...inventory, [id]: Math.max(0, inventory[id] - 1) });
+    },
+    [inventory, persistInventory],
+  );
+
+  const buyWithCoins = useCallback(
+    (id: PowerUpId): boolean => {
+      const def = POWERUPS[id];
+      if (coinBank < def.coinCost) return false;
+      persistCoins(coinBank - def.coinCost);
+      persistInventory({ ...inventory, [id]: inventory[id] + 1 });
+      return true;
+    },
+    [coinBank, inventory, persistCoins, persistInventory],
+  );
+
+  const grantPowerUp = useCallback(
+    (id: PowerUpId) => {
+      persistInventory({ ...inventory, [id]: inventory[id] + 1 });
+    },
+    [inventory, persistInventory],
+  );
+
+  const { buy: buyWithEth } = useEthPowerUpPurchase(grantPowerUp);
+
+  const startGame = useCallback(() => {
+    setScore(0);
+    setRunCoins(0);
+    setPaused(false);
+    setView('playing');
+  }, []);
+
+  const goHome = useCallback(() => {
+    // Save coins collected in the current run
+    if (runCoins > 0) {
+      persistCoins(coinBank + runCoins);
+      setRunCoins(0);
+    }
+    if (score > highScore) persistHighScore(score);
+    setView('home');
+    setPaused(false);
+  }, [runCoins, coinBank, persistCoins, score, highScore, persistHighScore]);
+
+  const totalCoinsDisplay = useMemo(
+    () => coinBank + (view === 'playing' ? runCoins : 0),
+    [coinBank, runCoins, view],
+  );
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 via-purple-50 to-pink-50 flex flex-col items-center justify-center p-4 pt-16">
-      <div className="w-full max-w-4xl space-y-6">
-        <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mb-6">
-          <div className="text-center sm:text-left">
-            <h1 className="text-5xl font-black bg-gradient-to-r from-blue-600 via-purple-600 to-pink-600 bg-clip-text text-transparent mb-2">jumparun</h1>
-            <p className="text-sm text-gray-600 font-medium">Powered by Base ⚡</p>
-          </div>
-          <ConnectWallet />
-        </div>
+    <main className="relative min-h-screen overflow-hidden bg-background text-foreground">
+      {/* Background decoration */}
+      <div className="pointer-events-none fixed inset-0">
+        <div className="absolute inset-0 grid-bg opacity-40" />
+        <div className="absolute left-1/2 top-0 h-[600px] w-[900px] -translate-x-1/2 rounded-full bg-primary/10 blur-[120px]" />
+        <div className="absolute bottom-0 right-0 h-[400px] w-[500px] rounded-full bg-accent/10 blur-[120px]" />
+      </div>
 
-        <Card className="bg-white/95 backdrop-blur-md shadow-2xl border-2 border-blue-200">
-          <CardContent className="p-8 space-y-6">
-            <div className="flex justify-between items-center bg-gradient-to-r from-blue-50 to-purple-50 rounded-xl p-4 border border-blue-200">
-              <div className="space-y-1">
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Score</p>
-                <p className="text-4xl font-black text-blue-600 tabular-nums">{score}</p>
-              </div>
-              <div className="space-y-1 text-right">
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">High Score</p>
-                <p className="text-4xl font-black text-purple-600 tabular-nums">{highScore}</p>
+      <div className="relative mx-auto flex max-w-6xl flex-col px-4 pb-10 pt-5">
+        {/* Top bar */}
+        <header className="mb-5 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="relative">
+              <div className="animate-pulse-glow flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-accent">
+                <Zap className="h-5 w-5 text-primary-foreground" fill="currentColor" />
               </div>
             </div>
+            <div>
+              <h1 className="font-display text-2xl font-bold leading-none tracking-tight">
+                <span className="bg-gradient-to-r from-primary via-primary to-accent bg-clip-text text-transparent">
+                  JUMPARUN
+                </span>
+              </h1>
+              <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+                Endless runner · Base chain
+              </p>
+            </div>
+          </div>
 
-            <div className="flex justify-center">
-              {isPlaying ? (
-                <Game2D
-                  isPlaying={isPlaying}
-                  autoJumpActive={autoJumpActive}
-                  autoJumpRemaining={autoJumpRemaining}
-                  onGameOver={handleGameOver}
-                  onScoreUpdate={handleScoreUpdate}
-                  onAutoJumpExpired={handleAutoJumpExpired}
-                  onAutoJumpUsed={handleAutoJumpUsed}
-                />
-              ) : (
-                <div className="w-full max-w-[800px] h-[400px] border-4 border-blue-600 rounded-xl shadow-2xl bg-gradient-to-br from-blue-100 via-purple-100 to-pink-100 flex items-center justify-center relative overflow-hidden">
-                  <div className="absolute inset-0 bg-gradient-to-br from-blue-400/10 to-purple-400/10 animate-pulse"></div>
-                  <div className="text-center space-y-6 p-8 relative z-10">
-                    {showGameOver ? (
-                      <>
-                        <h2 className="text-5xl font-black text-gray-900 mb-4">Game Over!</h2>
-                        <div className="bg-white/80 rounded-xl p-6 backdrop-blur-sm border-2 border-blue-200">
-                          <p className="text-xl text-gray-600 mb-2">Final Score</p>
-                          <p className="text-6xl font-black bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">{score}</p>
-                        </div>
-                        {score === highScore && score > 0 && (
-                          <p className="text-2xl text-purple-600 font-bold animate-bounce">🎉 New High Score! 🎉</p>
-                        )}
-                      </>
-                    ) : (
-                      <>
-                        <h2 className="text-4xl font-black text-gray-900 mb-2">Ready to Jump?</h2>
-                        <p className="text-lg text-gray-600 mb-4">🎮 Tap anywhere to jump over obstacles!</p>
-                        <div className="bg-blue-50 rounded-lg p-4 border border-blue-200 mb-4">
-                          <p className="text-sm text-blue-600 font-semibold">⚡ Tip: Time your jumps perfectly to survive!</p>
-                        </div>
-                      </>
-                    )}
-                    <Button 
-                      onClick={startGame}
-                      size="lg"
-                      className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-black py-6 px-16 text-2xl rounded-xl shadow-xl hover:shadow-2xl transform hover:scale-105 transition-all duration-200"
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSwapOpen(true)}
+              className="group hidden items-center gap-2 rounded-xl border border-accent/30 bg-accent/10 px-3 py-2 transition-all hover:border-accent/60 hover:bg-accent/20 sm:inline-flex"
+            >
+              <ArrowLeftRight className="h-4 w-4 text-accent" />
+              <span className="font-display text-xs font-bold text-accent">Swap $JUMP</span>
+            </button>
+            <WalletButton />
+          </div>
+        </header>
+
+        {/* Stat bar */}
+        <div className="mb-4 grid grid-cols-3 gap-2">
+          <StatChip
+            icon={<Trophy className="h-4 w-4 text-primary" />}
+            label="Score"
+            value={view === 'playing' ? score.toLocaleString() : '—'}
+            accent="primary"
+          />
+          <StatChip
+            icon={<Coins className="h-4 w-4 text-accent" />}
+            label="Coins"
+            value={totalCoinsDisplay.toLocaleString()}
+            accent="accent"
+          />
+          <StatChip
+            icon={<Trophy className="h-4 w-4 text-neon-magenta" />}
+            label="Best"
+            value={highScore.toLocaleString()}
+            accent="magenta"
+          />
+        </div>
+
+        {/* Main content */}
+        {view === 'playing' ? (
+          <div className="flex flex-col items-center gap-4">
+            <Game2D
+              isPlaying
+              paused={paused}
+              inventory={inventory}
+              onGameOver={handleGameOver}
+              onScoreUpdate={handleScoreUpdate}
+              onCoinCollected={handleCoinCollected}
+              onConsumePowerUp={handleConsumePowerUp}
+              onPause={() => setPaused((p) => !p)}
+              onHome={goHome}
+            />
+
+            {paused && (
+              <div className="glass w-full max-w-[960px] rounded-2xl p-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="font-display text-lg font-bold">Quick Shop</h3>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setPaused(false)}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 font-display text-xs font-bold text-primary-foreground hover:brightness-110"
                     >
-                      {showGameOver ? '🔄 Play Again' : '🚀 Start Game'}
-                    </Button>
+                      <Play className="h-3.5 w-3.5" />
+                      Resume
+                    </button>
+                    <button
+                      onClick={goHome}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3 py-1.5 font-display text-xs font-bold text-foreground hover:bg-surface-3"
+                    >
+                      <HomeIcon className="h-3.5 w-3.5" />
+                      Home
+                    </button>
+                  </div>
+                </div>
+                <PowerUpShop
+                  coins={coinBank}
+                  inventory={inventory}
+                  onBuyWithCoins={buyWithCoins}
+                  onBuyWithEth={buyWithEth}
+                  compact
+                />
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="grid gap-4 lg:grid-cols-[1.3fr_1fr]">
+            {/* Hero card */}
+            <div className="glass relative overflow-hidden rounded-2xl p-6 sm:p-8">
+              <div className="pointer-events-none absolute -right-20 -top-20 h-60 w-60 rounded-full bg-primary/20 blur-3xl" />
+              <div className="pointer-events-none absolute -bottom-20 -left-20 h-60 w-60 rounded-full bg-accent/20 blur-3xl" />
+
+              {view === 'gameover' ? (
+                <div className="relative space-y-6">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-flex h-2 w-2 rounded-full bg-destructive" />
+                    <span className="font-display text-xs font-bold uppercase tracking-[0.2em] text-destructive">
+                      Run Ended
+                    </span>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase tracking-wider text-muted-foreground">
+                      Final score
+                    </p>
+                    <p className="font-display text-6xl font-black leading-none tracking-tight sm:text-7xl">
+                      <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
+                        {score.toLocaleString()}
+                      </span>
+                    </p>
+                    {score > 0 && score === highScore && (
+                      <p className="mt-2 font-display text-sm font-bold text-accent animate-float">
+                        ◆ NEW HIGH SCORE ◆
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <MiniStat label="Coins this run" value={runCoins.toString()} />
+                    <MiniStat label="Bank total" value={coinBank.toString()} />
+                  </div>
+
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      onClick={startGame}
+                      className="neon-glow-cyan inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-primary to-primary/80 px-6 py-3.5 font-display text-sm font-bold text-primary-foreground transition-all hover:scale-[1.02]"
+                    >
+                      <RotateCcw className="h-4 w-4" />
+                      Play Again
+                    </button>
+                    <button
+                      onClick={() => setView('home')}
+                      className="inline-flex items-center gap-2 rounded-xl border border-border bg-surface-2 px-5 py-3.5 font-display text-sm font-bold transition-all hover:bg-surface-3"
+                    >
+                      <HomeIcon className="h-4 w-4" />
+                      Home
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="relative space-y-6">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-flex h-2 w-2 animate-pulse rounded-full bg-neon-green" />
+                    <span className="font-display text-xs font-bold uppercase tracking-[0.2em] text-neon-green">
+                      Ready to run
+                    </span>
+                  </div>
+                  <div>
+                    <h2 className="font-display text-4xl font-black leading-tight tracking-tight sm:text-5xl text-balance">
+                      Jump. Dash. <span className="text-primary">Survive.</span>
+                    </h2>
+                    <p className="mt-3 max-w-md text-sm leading-relaxed text-muted-foreground">
+                      Tap, click or press space to jump. Hold for higher jumps. Collect coins, chain
+                      power-ups, and outrun obstacles across the grid.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+                    <Tip label="Tap" value="Jump" />
+                    <Tip label="Hold" value="Higher" />
+                    <Tip label="P" value="Pause" />
+                    <Tip label="Shop" value="Buy PU" />
+                  </div>
+
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      onClick={startGame}
+                      className="neon-glow-cyan inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-primary to-primary/80 px-7 py-4 font-display text-base font-bold text-primary-foreground transition-all hover:scale-[1.02]"
+                    >
+                      <Play className="h-5 w-5" fill="currentColor" />
+                      Start Game
+                    </button>
+
+                    <button
+                      onClick={() => setSwapOpen(true)}
+                      className="inline-flex items-center gap-2 rounded-xl border border-accent/40 bg-accent/10 px-5 py-4 font-display text-sm font-bold text-accent transition-all hover:bg-accent/20 sm:hidden"
+                    >
+                      <ArrowLeftRight className="h-4 w-4" />
+                      Swap $JUMP
+                    </button>
                   </div>
                 </div>
               )}
             </div>
 
-            <div className="border-t-2 border-blue-100 pt-6">
-              <div className="bg-gradient-to-r from-yellow-50 to-orange-50 border-2 border-yellow-400 rounded-xl p-5 shadow-lg">
-                <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-                  <div className="text-center sm:text-left">
-                    <h3 className="text-xl font-black text-gray-900 mb-2">
-                      ⚡ Auto-Jump Power-Up
-                    </h3>
-                    <p className="text-sm font-semibold text-gray-700">
-                      {autoJumpActive 
-                        ? `✅ Active - ${autoJumpRemaining} jumps remaining` 
-                        : '🎯 Automatically jump over obstacles'}
-                    </p>
-                    {autoJumpActive && (
-                      <p className="text-xs text-gray-600 mt-1">
-                        💡 Expires after {autoJumpRemaining} auto-jumps
-                      </p>
-                    )}
-                    <p className="text-xs font-bold text-orange-600 mt-2 bg-white/50 rounded px-2 py-1 inline-block">
-                      💎 Cost: {POWER_UP_COST} ETH on Base
+            {/* Side: swap promo + shop */}
+            <div className="flex flex-col gap-4">
+              <button
+                onClick={() => setSwapOpen(true)}
+                className="group relative overflow-hidden rounded-2xl border border-accent/30 bg-gradient-to-br from-accent/15 to-primary/10 p-5 text-left transition-all hover:border-accent/60"
+              >
+                <div className="pointer-events-none absolute -right-6 -top-6 h-24 w-24 rounded-full bg-accent/30 blur-2xl transition-opacity group-hover:opacity-70" />
+                <div className="relative flex items-start justify-between">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <ArrowLeftRight className="h-4 w-4 text-accent" />
+                      <span className="font-display text-[10px] font-bold uppercase tracking-[0.2em] text-accent">
+                        Onchain Trade
+                      </span>
+                    </div>
+                    <h3 className="mt-2 font-display text-xl font-bold">Swap $JUMP</h3>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Uniswap V3 · ETH ⇄ JUMP on Base
                     </p>
                   </div>
-                  <Button
-                    onClick={purchasePowerUp}
-                    disabled={!isConnected || (autoJumpActive && autoJumpRemaining > 0) || isPurchasing || isConfirming}
-                    className="bg-gradient-to-r from-yellow-400 to-orange-500 hover:from-yellow-500 hover:to-orange-600 text-white font-black text-lg px-8 py-6 rounded-xl shadow-lg hover:shadow-xl transform hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
-                  >
-                    {!isConnected
-                      ? 'Connect Wallet'
-                      : (autoJumpActive && autoJumpRemaining > 0)
-                      ? '✅ Purchased'
-                      : isPurchasing || isConfirming
-                      ? 'Processing...'
-                      : `Buy for ${POWER_UP_COST} ETH`}
-                  </Button>
+                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent/20">
+                    <ArrowLeftRight className="h-5 w-5 text-accent" />
+                  </div>
                 </div>
+                <div className="relative mt-4 flex items-center gap-2">
+                  <span className="rounded-full bg-surface-2 px-2.5 py-1 font-display text-[10px] font-bold text-muted-foreground">
+                    BASE
+                  </span>
+                  <span className="rounded-full bg-surface-2 px-2.5 py-1 font-display text-[10px] font-bold text-muted-foreground">
+                    V3 ROUTER
+                  </span>
+                </div>
+              </button>
+
+              <div className="glass rounded-2xl p-5">
+                <PowerUpShop
+                  coins={coinBank}
+                  inventory={inventory}
+                  onBuyWithCoins={buyWithCoins}
+                  onBuyWithEth={buyWithEth}
+                />
               </div>
             </div>
-          </CardContent>
-        </Card>
+          </div>
+        )}
+
+        {/* Footer tip */}
+        <p className="mt-6 text-center text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+          Powered by Base · $JUMP · 0x9649…f07e
+        </p>
+      </div>
+
+      <SwapModal open={swapOpen} onOpenChange={setSwapOpen} />
+    </main>
+  );
+}
+
+function StatChip({
+  icon,
+  label,
+  value,
+  accent,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  accent: 'primary' | 'accent' | 'magenta';
+}) {
+  const ring =
+    accent === 'primary'
+      ? 'border-primary/20'
+      : accent === 'accent'
+        ? 'border-accent/20'
+        : 'border-neon-magenta/20';
+  return (
+    <div
+      className={`flex items-center gap-2 rounded-xl border ${ring} bg-surface-1/60 px-3 py-2 backdrop-blur-md`}
+    >
+      <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-surface-3">
+        {icon}
+      </div>
+      <div className="min-w-0 leading-tight">
+        <p className="truncate text-[9px] font-bold uppercase tracking-[0.15em] text-muted-foreground">
+          {label}
+        </p>
+        <p className="font-display text-sm font-bold tabular-nums text-foreground">{value}</p>
       </div>
     </div>
   );
 }
+
+function MiniStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-border bg-surface-2 px-3 py-2.5">
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+      <p className="font-display text-xl font-bold tabular-nums">{value}</p>
+    </div>
+  );
+}
+
+function Tip({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-primary/15 bg-surface-2 px-2.5 py-2">
+      <p className="font-display text-[10px] font-bold uppercase tracking-wider text-primary">
+        {label}
+      </p>
+      <p className="font-medium text-foreground">{value}</p>
+    </div>
+  );
+}
+

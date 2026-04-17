@@ -1,40 +1,59 @@
-import type { Metadata } from 'next';
-import '@coinbase/onchainkit/styles.css';
+import type { Metadata, Viewport } from 'next';
+import { Space_Grotesk, Inter } from 'next/font/google';
 import './globals.css';
 import { Providers } from './providers';
-import FarcasterWrapper from "@/components/FarcasterWrapper";
+import { Toaster } from 'sonner';
+
+const spaceGrotesk = Space_Grotesk({
+  subsets: ['latin'],
+  variable: '--font-display',
+  display: 'swap',
+});
+
+const inter = Inter({
+  subsets: ['latin'],
+  variable: '--font-body',
+  display: 'swap',
+});
 
 export const metadata: Metadata = {
-  title: "jumparun",
-  description: "Endless jumper game with tap to jump mechanics. Avoid obstacles, purchase 10x auto-jump for $0.0001 in Base ETH. Intensifies over time. Integrates with Base wallet for seamless play.",
-  other: { 
-    "base:app_id": "6943dd0cd77c069a945bdffd",
-    "fc:frame": JSON.stringify({
-      "version":"next",
-      "imageUrl":"https://usdozf7pplhxfvrl.public.blob.vercel-storage.com/thumbnail_b7e73ae8-8ba7-4a98-ada1-621195d4439f-ST8iDzsWSHB58RfyEW2dXKt0tEPSKq",
-      "button":{
-        "title":"Open with Ohara",
-        "action":{
-          "type":"launch_frame",
-          "name":"jumparun",
-          "url":"https://camera-onto-814.app.ohara.ai",
-          "splashImageUrl":"https://usdozf7pplhxfvrl.public.blob.vercel-storage.com/farcaster/splash_images/splash_image1.svg",
-          "splashBackgroundColor":"#ffffff"
-        }
-      }
-    }) 
-  }
+  title: 'Jumparun | Endless Runner on Base',
+  description:
+    'Sleek endless runner with power-ups, coin collecting and on-chain swaps. Powered by the $JUMP token on Base.',
+  applicationName: 'Jumparun',
+  authors: [{ name: 'Jumparun' }],
+  keywords: ['jumparun', 'base', 'game', 'jump', 'token', 'onchain', 'runner'],
+  openGraph: {
+    title: 'Jumparun',
+    description: 'Endless runner on Base. Jump, dash, collect — and swap $JUMP.',
+    type: 'website',
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: '#05070F',
+  width: 'device-width',
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body>
-        <Providers>
-          <FarcasterWrapper>
-            {children}
-          </FarcasterWrapper>
-        </Providers>
+    <html lang="en" className={`${spaceGrotesk.variable} ${inter.variable} bg-background`}>
+      <body className="font-sans antialiased bg-background text-foreground">
+        <Providers>{children}</Providers>
+        <Toaster
+          position="top-center"
+          theme="dark"
+          toastOptions={{
+            style: {
+              background: 'hsl(222 40% 8%)',
+              border: '1px solid hsl(190 95% 50% / 0.25)',
+              color: 'hsl(210 20% 96%)',
+            },
+          }}
+        />
       </body>
     </html>
   );

@@ -1,35 +1,49 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { Home, Pause, Play } from 'lucide-react';
+import type { PowerUpId, PowerUpInventory } from '@/lib/powerups';
 
 export interface Game2DProps {
   isPlaying: boolean;
-  autoJumpActive: boolean;
-  autoJumpRemaining: number;
-  onGameOver: (score: number) => void;
+  paused: boolean;
+  inventory: PowerUpInventory;
+  onGameOver: (score: number, coinsCollected: number) => void;
   onScoreUpdate: (score: number) => void;
-  onAutoJumpExpired: () => void;
-  onAutoJumpUsed: () => void;
+  onCoinCollected: (total: number) => void;
+  onConsumePowerUp: (id: PowerUpId) => void;
+  onPause: () => void;
+  onHome: () => void;
 }
 
-interface GameObject {
+interface Vec {
   x: number;
   y: number;
-  width: number;
-  height: number;
-  velocityY: number;
 }
 
-interface Obstacle {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+interface Player extends Vec {
+  w: number;
+  h: number;
+  vy: number;
+  onGround: boolean;
+  jumpsUsed: number;
+  trail: Vec[];
 }
 
-interface Particle {
-  x: number;
-  y: number;
+type ObstacleType = 'spike' | 'tall' | 'drone' | 'saw';
+interface Obstacle extends Vec {
+  w: number;
+  h: number;
+  type: ObstacleType;
+  phase: number;
+}
+
+interface Coin extends Vec {
+  collected: boolean;
+  bob: number;
+}
+
+interface Particle extends Vec {
   vx: number;
   vy: number;
   life: number;
@@ -37,400 +51,862 @@ interface Particle {
   color: string;
 }
 
-interface Cloud {
-  x: number;
-  y: number;
-  speed: number;
+interface Star extends Vec {
   size: number;
+  speed: number;
+  twinkle: number;
 }
 
-export default function Game2D({ isPlaying, autoJumpActive, autoJumpRemaining, onGameOver, onScoreUpdate, onAutoJumpExpired, onAutoJumpUsed }: Game2DProps) {
+interface Mountain {
+  x: number;
+  w: number;
+  h: number;
+  shade: number;
+}
+
+export default function Game2D({
+  isPlaying,
+  paused,
+  inventory,
+  onGameOver,
+  onScoreUpdate,
+  onCoinCollected,
+  onConsumePowerUp,
+  onPause,
+  onHome,
+}: Game2DProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 400 });
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const baseLogoRef = useRef<HTMLImageElement | null>(null);
-  
-  // Store callbacks and state in refs to prevent game restarts
-  const onGameOverRef = useRef(onGameOver);
-  const onScoreUpdateRef = useRef(onScoreUpdate);
-  const onAutoJumpExpiredRef = useRef(onAutoJumpExpired);
-  const onAutoJumpUsedRef = useRef(onAutoJumpUsed);
-  const autoJumpActiveRef = useRef(autoJumpActive);
-  const autoJumpRemainingRef = useRef(autoJumpRemaining);
-  
-  // Update refs when values change (but don't restart game)
+  const [dimensions, setDimensions] = useState({ width: 800, height: 480 });
+  const audioCtxRef = useRef<AudioContext | null>(null);
+
+  // Callback refs so we don't restart the game loop
+  const cbRef = useRef({
+    onGameOver,
+    onScoreUpdate,
+    onCoinCollected,
+    onConsumePowerUp,
+  });
+  const pausedRef = useRef(paused);
+  const inventoryRef = useRef(inventory);
+
   useEffect(() => {
-    onGameOverRef.current = onGameOver;
-    onScoreUpdateRef.current = onScoreUpdate;
-    onAutoJumpExpiredRef.current = onAutoJumpExpired;
-    onAutoJumpUsedRef.current = onAutoJumpUsed;
-    autoJumpActiveRef.current = autoJumpActive;
-    autoJumpRemainingRef.current = autoJumpRemaining;
-  }, [onGameOver, onScoreUpdate, onAutoJumpExpired, onAutoJumpUsed, autoJumpActive, autoJumpRemaining]);
-  
-  // Load Base logo
+    cbRef.current = { onGameOver, onScoreUpdate, onCoinCollected, onConsumePowerUp };
+  }, [onGameOver, onScoreUpdate, onCoinCollected, onConsumePowerUp]);
+
   useEffect(() => {
-    const img = new Image();
-    img.src = 'data:image/svg+xml;base64,' + btoa(`
-      <svg width="111" height="111" viewBox="0 0 111 111" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M54.921 110.034C85.359 110.034 110.034 85.402 110.034 55.017C110.034 24.6319 85.359 0 54.921 0C26.0432 0 2.35281 22.1714 0 50.3923H72.8467V59.6416H3.9565e-07C2.35281 87.8625 26.0432 110.034 54.921 110.034Z" fill="#0052FF"/>
-      </svg>
-    `);
-    img.onload = () => {
-      baseLogoRef.current = img;
+    pausedRef.current = paused;
+  }, [paused]);
+
+  useEffect(() => {
+    inventoryRef.current = inventory;
+  }, [inventory]);
+
+  // Responsive sizing
+  useEffect(() => {
+    const update = () => {
+      const maxW = Math.min(window.innerWidth - 16, 960);
+      const h = Math.min(window.innerHeight * 0.68, 520);
+      setDimensions({ width: maxW, height: h });
     };
-  }, []);
-  
-  useEffect(() => {
-    const updateDimensions = () => {
-      const width = Math.min(window.innerWidth - 32, 800);
-      const height = Math.min(window.innerHeight * 0.6, 400);
-      setDimensions({ width, height });
-    };
-    
-    updateDimensions();
-    window.addEventListener('resize', updateDimensions);
-    return () => window.removeEventListener('resize', updateDimensions);
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
   }, []);
 
+  // Sound helpers
+  const playSound = useCallback((type: 'jump' | 'coin' | 'hit' | 'powerup' | 'dash') => {
+    try {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      if (type === 'jump') {
+        osc.frequency.setValueAtTime(420, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(780, ctx.currentTime + 0.12);
+        gain.gain.setValueAtTime(0.15, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.12);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.12);
+      } else if (type === 'coin') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(1320, ctx.currentTime + 0.08);
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.08);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.1);
+      } else if (type === 'hit') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(260, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(60, ctx.currentTime + 0.4);
+        gain.gain.setValueAtTime(0.2, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.4);
+      } else if (type === 'powerup') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(520, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(1040, ctx.currentTime + 0.2);
+        gain.gain.setValueAtTime(0.14, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.2);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.22);
+      } else {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(180, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(600, ctx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.12, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.15);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Main game loop
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !isPlaying) return;
-
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Initialize Audio Context
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    if (!audioCtxRef.current) {
+      try {
+        audioCtxRef.current = new (window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      } catch {
+        /* ignore */
+      }
     }
 
-    const audioCtx = audioContextRef.current;
+    const W = dimensions.width;
+    const H = dimensions.height;
+    const GROUND_Y = H - 70;
 
-    // Sound effect functions
-    const playJumpSound = () => {
-      if (!audioCtx) return;
-      const oscillator = audioCtx.createOscillator();
-      const gainNode = audioCtx.createGain();
-      
-      oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-      
-      oscillator.frequency.setValueAtTime(400, audioCtx.currentTime);
-      oscillator.frequency.exponentialRampToValueAtTime(600, audioCtx.currentTime + 0.1);
-      
-      gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
-      
-      oscillator.start(audioCtx.currentTime);
-      oscillator.stop(audioCtx.currentTime + 0.1);
-    };
+    // Physics
+    const GRAVITY = 0.85;
+    const JUMP_V = -15.5;
+    const DOUBLE_JUMP_V = -13;
+    const MAX_HOLD = 10; // frames of variable-height jump
 
-    const playGameOverSound = () => {
-      if (!audioCtx) return;
-      const oscillator = audioCtx.createOscillator();
-      const gainNode = audioCtx.createGain();
-      
-      oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-      
-      oscillator.frequency.setValueAtTime(400, audioCtx.currentTime);
-      oscillator.frequency.exponentialRampToValueAtTime(100, audioCtx.currentTime + 0.3);
-      
-      gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
-      
-      oscillator.start(audioCtx.currentTime);
-      oscillator.stop(audioCtx.currentTime + 0.3);
-    };
-
-    // Game constants - HIGHER JUMPS!
-    const GRAVITY: number = 0.8;
-    const JUMP_FORCE: number = -18; // Much higher!
-    const GROUND_Y: number = dimensions.height - 80;
-    const PLAYER_SIZE: number = 50;
-    const OBSTACLE_WIDTH: number = 35;
-    const OBSTACLE_HEIGHT: number = 60;
-    const INITIAL_SPEED: number = 4;
-    const SPEED_INCREMENT: number = 0.001;
-    const MIN_OBSTACLE_SPACING: number = 350;
-    const MAX_OBSTACLE_SPACING: number = 600;
-
-    let player: GameObject = {
-      x: 100,
-      y: GROUND_Y - PLAYER_SIZE,
-      width: PLAYER_SIZE,
-      height: PLAYER_SIZE,
-      velocityY: 0
+    const player: Player = {
+      x: 120,
+      y: GROUND_Y - 52,
+      w: 46,
+      h: 52,
+      vy: 0,
+      onGround: true,
+      jumpsUsed: 0,
+      trail: [],
     };
 
     let obstacles: Obstacle[] = [];
+    let coins: Coin[] = [];
     let particles: Particle[] = [];
-    let clouds: Cloud[] = [];
-    let score: number = 0;
-    let gameSpeed: number = INITIAL_SPEED;
-    let isJumping: boolean = false;
-    let gameActive: boolean = true;
-    let lastObstacleX: number = dimensions.width;
-    let animationId: number;
-    let cameraShake: number = 0;
-    let scorePopup: { value: number; opacity: number; y: number } | null = null;
-    let lastAutoJumpTime: number = 0;
-    let lastJumpedObstacleX: number = -1000; // Track last obstacle we jumped over
+    const stars: Star[] = [];
+    const mountains: Mountain[] = [];
 
-    // Initialize clouds
-    for (let i = 0; i < 5; i++) {
-      clouds.push({
-        x: Math.random() * dimensions.width,
-        y: Math.random() * (GROUND_Y - 100),
-        speed: 0.2 + Math.random() * 0.3,
-        size: 40 + Math.random() * 30
+    // Background layers
+    for (let i = 0; i < 60; i++) {
+      stars.push({
+        x: Math.random() * W,
+        y: Math.random() * (GROUND_Y - 40),
+        size: Math.random() * 1.5 + 0.3,
+        speed: 0.08 + Math.random() * 0.2,
+        twinkle: Math.random() * Math.PI * 2,
+      });
+    }
+    for (let i = 0; i < 10; i++) {
+      mountains.push({
+        x: (W / 5) * i + Math.random() * 60,
+        w: 160 + Math.random() * 120,
+        h: 80 + Math.random() * 120,
+        shade: Math.random() * 0.3,
       });
     }
 
-    const createParticles = (x: number, y: number, color: string) => {
-      for (let i = 0; i < 8; i++) {
+    let score = 0;
+    let coinCount = 0;
+    let speed = 5.2;
+    let lastObstacleX = W;
+    let lastCoinX = W;
+    let gameActive = true;
+    let cameraShake = 0;
+    let jumpHold = 0;
+    let isHoldingJump = false;
+
+    // Power-up runtime state
+    let shieldActive = inventoryRef.current.shield > 0;
+    let djRemaining = inventoryRef.current.doubleJump;
+    let autoJumpRemaining = inventoryRef.current.autoJump;
+    let magnetEnd = inventoryRef.current.magnet > 0 ? performance.now() + 12000 : 0;
+    let rocketEnd = inventoryRef.current.rocket > 0 ? performance.now() + 5000 : 0;
+    let slowmoEnd = inventoryRef.current.slowmo > 0 ? performance.now() + 8000 : 0;
+
+    // Consume starting power-ups
+    if (shieldActive) cbRef.current.onConsumePowerUp('shield');
+    if (inventoryRef.current.magnet > 0) cbRef.current.onConsumePowerUp('magnet');
+    if (inventoryRef.current.rocket > 0) cbRef.current.onConsumePowerUp('rocket');
+    if (inventoryRef.current.slowmo > 0) cbRef.current.onConsumePowerUp('slowmo');
+
+    let lastAutoJump = 0;
+
+    const spawnParticles = (x: number, y: number, color: string, count = 10, spread = 6) => {
+      for (let i = 0; i < count; i++) {
         particles.push({
           x,
           y,
-          vx: (Math.random() - 0.5) * 8,
-          vy: (Math.random() - 0.5) * 8 - 4,
+          vx: (Math.random() - 0.5) * spread,
+          vy: (Math.random() - 0.8) * spread,
           life: 1,
-          size: 3 + Math.random() * 4,
-          color
+          size: 2 + Math.random() * 3,
+          color,
         });
       }
     };
 
-    const jump = (): void => {
-      if (!isJumping && player.y >= GROUND_Y - PLAYER_SIZE - 5) {
-        player.velocityY = JUMP_FORCE;
-        isJumping = true;
-        playJumpSound();
-        createParticles(player.x + player.width / 2, player.y + player.height, '#0052FF');
+    const doJump = () => {
+      const now = performance.now();
+      const rocketOn = now < rocketEnd;
+      if (rocketOn) return; // rocket makes you fly
+      if (player.onGround) {
+        player.vy = JUMP_V;
+        player.onGround = false;
+        player.jumpsUsed = 1;
+        jumpHold = 0;
+        isHoldingJump = true;
+        playSound('jump');
+        spawnParticles(player.x + player.w / 2, player.y + player.h, 'hsl(190 95% 50%)', 8, 5);
+      } else if (djRemaining > 0 && player.jumpsUsed < 2) {
+        player.vy = DOUBLE_JUMP_V;
+        player.jumpsUsed = 2;
+        jumpHold = 0;
+        isHoldingJump = true;
+        djRemaining--;
+        playSound('jump');
+        spawnParticles(player.x + player.w / 2, player.y + player.h / 2, 'hsl(145 70% 50%)', 14, 7);
       }
     };
 
-    const handleInput = (): void => {
-      jump();
+    const onDown = (e: Event) => {
+      e.preventDefault();
+      if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+        audioCtxRef.current.resume();
+      }
+      doJump();
     };
-
-    const spawnObstacle = (): void => {
-      if (obstacles.length === 0 || 
-          lastObstacleX < dimensions.width - MIN_OBSTACLE_SPACING) {
-        const spacing: number = MIN_OBSTACLE_SPACING + 
-                               Math.random() * (MAX_OBSTACLE_SPACING - MIN_OBSTACLE_SPACING);
-        
-        obstacles.push({
-          x: dimensions.width,
-          y: GROUND_Y - OBSTACLE_HEIGHT,
-          width: OBSTACLE_WIDTH,
-          height: OBSTACLE_HEIGHT
-        });
-        
-        lastObstacleX = dimensions.width;
+    const onUp = () => {
+      isHoldingJump = false;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+        e.preventDefault();
+        doJump();
+        isHoldingJump = true;
+      }
+      if (e.code === 'KeyP') onPause();
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+        isHoldingJump = false;
       }
     };
 
-    const checkCollision = (obj1: GameObject | Obstacle, obj2: Obstacle): boolean => {
-      const margin = 5; // Slightly more forgiving hitbox
-      return (
-        obj1.x + margin < obj2.x + obj2.width &&
-        obj1.x + obj1.width - margin > obj2.x &&
-        obj1.y + margin < obj2.y + obj2.height &&
-        obj1.y + obj1.height - margin > obj2.y
-      );
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mouseup', onUp);
+    canvas.addEventListener('touchstart', onDown, { passive: false });
+    canvas.addEventListener('touchend', onUp);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKeyUp);
+
+    const spawnObstacle = () => {
+      if (lastObstacleX > W - 320) return;
+      const r = Math.random();
+      let type: ObstacleType;
+      let w = 34;
+      let h = 54;
+      let y = GROUND_Y - h;
+      if (r < 0.4) {
+        type = 'spike';
+        w = 30;
+        h = 42;
+        y = GROUND_Y - h;
+      } else if (r < 0.65) {
+        type = 'tall';
+        w = 34;
+        h = 78;
+        y = GROUND_Y - h;
+      } else if (r < 0.85) {
+        type = 'saw';
+        w = 42;
+        h = 42;
+        y = GROUND_Y - h;
+      } else {
+        type = 'drone';
+        w = 46;
+        h = 30;
+        y = GROUND_Y - 125 - Math.random() * 30;
+      }
+      const minGap = 300;
+      const maxGap = 500;
+      const obstacleX = W + minGap + Math.random() * (maxGap - minGap);
+      obstacles.push({ x: obstacleX, y, w, h, type, phase: 0 });
+      lastObstacleX = obstacleX;
     };
 
-    const update = (): void => {
-      if (!gameActive) return;
-
-      // Player physics
-      player.velocityY += GRAVITY;
-      player.y += player.velocityY;
-
-      if (player.y >= GROUND_Y - PLAYER_SIZE) {
-        player.y = GROUND_Y - PLAYER_SIZE;
-        player.velocityY = 0;
-        isJumping = false;
-        
-        // Landing particles
-        if (Math.random() > 0.8) {
-          createParticles(player.x + player.width / 2, player.y + player.height, '#0052FF');
+    const spawnCoins = () => {
+      if (lastCoinX > W - 180) return;
+      const baseX = W + 200 + Math.random() * 200;
+      const pattern = Math.floor(Math.random() * 3);
+      if (pattern === 0) {
+        // arc over obstacle
+        for (let i = 0; i < 5; i++) {
+          const t = i / 4;
+          const x = baseX + i * 34;
+          const y = GROUND_Y - 80 - Math.sin(t * Math.PI) * 60;
+          coins.push({ x, y, collected: false, bob: Math.random() * Math.PI * 2 });
+        }
+      } else if (pattern === 1) {
+        // line mid-air
+        for (let i = 0; i < 4; i++) {
+          coins.push({
+            x: baseX + i * 40,
+            y: GROUND_Y - 110,
+            collected: false,
+            bob: Math.random() * Math.PI * 2,
+          });
+        }
+      } else {
+        // zigzag low/high
+        for (let i = 0; i < 5; i++) {
+          coins.push({
+            x: baseX + i * 40,
+            y: GROUND_Y - 60 - (i % 2) * 70,
+            collected: false,
+            bob: Math.random() * Math.PI * 2,
+          });
         }
       }
+      lastCoinX = baseX + 200;
+    };
 
-      // Game speed
-      gameSpeed += SPEED_INCREMENT;
-      score += 1;
-      const displayScore = Math.floor(score / 60);
-      onScoreUpdateRef.current(displayScore);
+    const rectHit = (ax: number, ay: number, aw: number, ah: number, o: Obstacle) => {
+      const m = 4;
+      return ax + m < o.x + o.w && ax + aw - m > o.x && ay + m < o.y + o.h && ay + ah - m > o.y;
+    };
 
-      // Update obstacles
-      obstacles.forEach((obstacle: Obstacle) => {
-        obstacle.x -= gameSpeed;
-      });
+    let animId = 0;
+    let lastTime = performance.now();
 
-      obstacles = obstacles.filter((obstacle: Obstacle) => 
-        obstacle.x + obstacle.width > -50
-      );
+    const update = () => {
+      const now = performance.now();
+      const magnetOn = now < magnetEnd;
+      const rocketOn = now < rocketEnd;
+      const slowmoOn = now < slowmoEnd;
 
-      if (obstacles.length > 0) {
-        lastObstacleX = obstacles[obstacles.length - 1].x;
+      const effSpeed = rocketOn ? speed * 1.8 : slowmoOn ? speed * 0.55 : speed;
+
+      // Variable jump height - hold to go higher
+      if (isHoldingJump && jumpHold < MAX_HOLD && player.vy < 0) {
+        player.vy -= 0.55;
+        jumpHold++;
       }
 
-      spawnObstacle();
-
-      // Auto-jump logic - ONE jump per obstacle, based on remaining jumps from parent
-      if (autoJumpActiveRef.current && autoJumpRemainingRef.current > 0 && obstacles.length > 0) {
-        const nearestObstacle: Obstacle = obstacles[0];
-        const distanceToObstacle: number = nearestObstacle.x - (player.x + player.width);
-        
-        // Fixed jump window for optimal jumping
-        const optimalJumpDistance: number = 120;
-        const jumpTolerance: number = 30;
-        const minDistance: number = optimalJumpDistance - jumpTolerance; // 90
-        const maxDistance: number = optimalJumpDistance + jumpTolerance; // 150
-        
-        // Check if this is a NEW obstacle (not the one we already jumped for)
-        const isNewObstacle = Math.abs(nearestObstacle.x - lastJumpedObstacleX) > 50;
-        
-        // Only jump when: new obstacle, in range, player grounded, and cooldown elapsed
-        const currentTime = Date.now();
-        const timeSinceLastJump = currentTime - lastAutoJumpTime;
-        const isGrounded = player.y >= GROUND_Y - PLAYER_SIZE - 5;
-        
-        if (isNewObstacle &&
-            distanceToObstacle > minDistance && 
-            distanceToObstacle < maxDistance && 
-            !isJumping &&
-            isGrounded &&
-            timeSinceLastJump > 600) { // 600ms cooldown
-          jump();
-          lastAutoJumpTime = currentTime;
-          lastJumpedObstacleX = nearestObstacle.x; // Remember this obstacle
-          onAutoJumpUsedRef.current(); // Notify parent to decrement counter
-          
-          // Show remaining jumps popup
-          const remaining = autoJumpRemainingRef.current - 1;
-          scorePopup = {
-            value: remaining,
-            opacity: 1,
-            y: 80
-          };
-          
-          // Check if this was the last jump
-          if (remaining <= 0) {
-            setTimeout(() => {
-              onAutoJumpExpiredRef.current();
-            }, 500);
+      // Auto-jump
+      if (autoJumpRemaining > 0 && obstacles.length > 0 && player.onGround) {
+        const next = obstacles.find((o) => o.x + o.w > player.x);
+        if (next) {
+          const dist = next.x - (player.x + player.w);
+          if (dist > 100 && dist < 170 && now - lastAutoJump > 500) {
+            doJump();
+            autoJumpRemaining--;
+            lastAutoJump = now;
           }
         }
       }
 
-      // Update particles
-      particles = particles.filter(p => {
+      // Rocket: float at mid-air
+      if (rocketOn) {
+        const target = GROUND_Y - 180;
+        player.y += (target - player.y) * 0.18;
+        player.vy = 0;
+        player.onGround = false;
+      } else {
+        player.vy += GRAVITY;
+        if (player.vy > 22) player.vy = 22;
+        player.y += player.vy;
+        if (player.y >= GROUND_Y - player.h) {
+          player.y = GROUND_Y - player.h;
+          player.vy = 0;
+          if (!player.onGround) {
+            spawnParticles(player.x + player.w / 2, GROUND_Y, 'hsl(190 95% 50%)', 6, 4);
+          }
+          player.onGround = true;
+          player.jumpsUsed = 0;
+          jumpHold = 0;
+        }
+      }
+
+      // Trail
+      player.trail.push({ x: player.x + player.w / 2, y: player.y + player.h / 2 });
+      if (player.trail.length > 14) player.trail.shift();
+
+      // Speed up over time (slight)
+      speed += 0.0012;
+
+      // Move & spawn obstacles
+      obstacles.forEach((o) => {
+        o.x -= effSpeed;
+        o.phase += 0.1;
+        if (o.type === 'drone') o.y += Math.sin(o.phase) * 0.6;
+      });
+      obstacles = obstacles.filter((o) => o.x + o.w > -40);
+      if (obstacles.length > 0) lastObstacleX = obstacles[obstacles.length - 1].x;
+      spawnObstacle();
+
+      // Coins
+      coins.forEach((c) => {
+        c.x -= effSpeed;
+        c.bob += 0.14;
+        if (magnetOn) {
+          const dx = player.x + player.w / 2 - c.x;
+          const dy = player.y + player.h / 2 - c.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist < 220) {
+            const pull = (1 - dist / 220) * 5;
+            c.x += (dx / dist) * pull;
+            c.y += (dy / dist) * pull;
+          }
+        }
+      });
+      coins = coins.filter((c) => !c.collected && c.x > -40);
+      if (coins.length > 0) lastCoinX = coins[coins.length - 1].x;
+      spawnCoins();
+
+      // Coin pickups
+      for (const c of coins) {
+        const dx = c.x - (player.x + player.w / 2);
+        const dy = c.y - (player.y + player.h / 2);
+        if (Math.hypot(dx, dy) < 26) {
+          c.collected = true;
+          coinCount++;
+          cbRef.current.onCoinCollected(coinCount);
+          playSound('coin');
+          spawnParticles(c.x, c.y, 'hsl(35 95% 58%)', 6, 3);
+        }
+      }
+
+      // Obstacle collision
+      for (const o of obstacles) {
+        if (rectHit(player.x, player.y, player.w, player.h, o)) {
+          if (rocketOn) {
+            // destroy obstacle
+            spawnParticles(o.x + o.w / 2, o.y + o.h / 2, 'hsl(35 95% 58%)', 20, 9);
+            o.x = -9999;
+            cameraShake = 6;
+            playSound('hit');
+            continue;
+          }
+          if (shieldActive) {
+            shieldActive = false;
+            spawnParticles(
+              player.x + player.w / 2,
+              player.y + player.h / 2,
+              'hsl(190 95% 50%)',
+              30,
+              10,
+            );
+            // clear nearby obstacles
+            obstacles.forEach((other) => {
+              if (Math.abs(other.x - player.x) < 180) other.x = -9999;
+            });
+            cameraShake = 8;
+            playSound('powerup');
+            continue;
+          }
+          // Game over
+          gameActive = false;
+          cameraShake = 14;
+          playSound('hit');
+          spawnParticles(
+            player.x + player.w / 2,
+            player.y + player.h / 2,
+            'hsl(0 84% 60%)',
+            26,
+            10,
+          );
+          cbRef.current.onGameOver(Math.floor(score), coinCount);
+          return;
+        }
+      }
+
+      // Particles
+      particles.forEach((p) => {
         p.x += p.vx;
         p.y += p.vy;
-        p.vy += 0.3; // gravity
-        p.life -= 0.02;
-        return p.life > 0;
+        p.vy += 0.35;
+        p.life -= 0.022;
+      });
+      particles = particles.filter((p) => p.life > 0);
+
+      // Stars & mountains
+      stars.forEach((s) => {
+        s.x -= s.speed;
+        s.twinkle += 0.04;
+        if (s.x < -4) {
+          s.x = W + 4;
+          s.y = Math.random() * (GROUND_Y - 40);
+        }
+      });
+      mountains.forEach((m) => {
+        m.x -= effSpeed * 0.15;
+        if (m.x + m.w < -20) {
+          m.x = W + Math.random() * 80;
+          m.w = 160 + Math.random() * 120;
+          m.h = 80 + Math.random() * 120;
+        }
       });
 
-      // Update clouds
-      clouds.forEach(cloud => {
-        cloud.x -= cloud.speed;
-        if (cloud.x + cloud.size < 0) {
-          cloud.x = dimensions.width + cloud.size;
-          cloud.y = Math.random() * (GROUND_Y - 100);
-        }
-      });
+      // Scoring
+      const gain = rocketOn ? 2.4 : 1.2;
+      score += gain;
+      cbRef.current.onScoreUpdate(Math.floor(score));
 
-      // Camera shake decay
-      if (cameraShake > 0) {
-        cameraShake *= 0.9;
-      }
-
-      // Score popup animation
-      if (scorePopup) {
-        scorePopup.y -= 2;
-        scorePopup.opacity -= 0.02;
-        if (scorePopup.opacity <= 0) {
-          scorePopup = null;
-        }
-      }
-
-      // Collision detection
-      for (const obstacle of obstacles) {
-        if (checkCollision(player, obstacle)) {
-          gameActive = false;
-          cameraShake = 10;
-          playGameOverSound();
-          createParticles(player.x + player.width / 2, player.y + player.height / 2, '#FF4444');
-          onGameOverRef.current(displayScore);
-          break;
-        }
-      }
+      if (cameraShake > 0) cameraShake *= 0.88;
     };
 
-    const drawCloud = (x: number, y: number, size: number) => {
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+    const drawPlayer = () => {
+      const now = performance.now();
+      const rocketOn = now < rocketEnd;
+      const magnetOn = now < magnetEnd;
+      const slowmoOn = now < slowmoEnd;
+
+      // Trail
+      for (let i = 0; i < player.trail.length; i++) {
+        const t = player.trail[i];
+        const a = i / player.trail.length;
+        ctx.globalAlpha = a * 0.5;
+        ctx.fillStyle = rocketOn ? 'hsl(35 95% 58%)' : 'hsl(190 95% 50%)';
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, 4 + a * 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+      // Player body - Base-inspired design
+      const px = player.x;
+      const py = player.y;
+      const pw = player.w;
+      const ph = player.h;
+
+      // Glow
+      ctx.shadowColor = rocketOn ? 'hsl(35 95% 58%)' : 'hsl(190 95% 50%)';
+      ctx.shadowBlur = 22;
+
+      // Body - hexagonal chip design
+      const cx = px + pw / 2;
+      const cy = py + ph / 2;
+      const r = pw / 2;
+
+      // Outer hex
+      ctx.fillStyle = rocketOn ? 'hsl(35 95% 58%)' : 'hsl(190 95% 50%)';
       ctx.beginPath();
-      ctx.arc(x, y, size * 0.5, 0, Math.PI * 2);
-      ctx.arc(x + size * 0.4, y, size * 0.35, 0, Math.PI * 2);
-      ctx.arc(x - size * 0.4, y, size * 0.35, 0, Math.PI * 2);
+      for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
+        const x = cx + Math.cos(a) * r;
+        const y = cy + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
       ctx.fill();
+
+      // Inner core
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'hsl(222 47% 5%)';
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * 0.55, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Eye
+      ctx.fillStyle = rocketOn ? 'hsl(35 95% 58%)' : 'hsl(190 95% 50%)';
+      ctx.beginPath();
+      ctx.arc(cx + 4, cy - 2, r * 0.22, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Shield aura
+      if (shieldActive) {
+        ctx.strokeStyle = `hsl(190 95% 50% / ${0.5 + Math.sin(now * 0.01) * 0.3})`;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r + 10, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Magnet ring
+      if (magnetOn) {
+        ctx.strokeStyle = `hsl(320 90% 60% / ${0.3 + Math.sin(now * 0.008) * 0.2})`;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 6]);
+        ctx.beginPath();
+        ctx.arc(cx, cy, 200, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Slow-mo ripple
+      if (slowmoOn) {
+        ctx.strokeStyle = `hsl(190 95% 50% / ${0.2 + Math.sin(now * 0.005) * 0.15})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r + 16 + Math.sin(now * 0.01) * 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Rocket flames
+      if (rocketOn) {
+        ctx.fillStyle = 'hsl(35 95% 58%)';
+        for (let i = 0; i < 4; i++) {
+          ctx.globalAlpha = 0.6 - i * 0.14;
+          ctx.beginPath();
+          ctx.ellipse(px - 6 - i * 8, cy, 4, 10 + i * 2, 0, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
     };
 
-    const draw = (): void => {
+    const drawObstacle = (o: Obstacle) => {
+      ctx.save();
+      const now = performance.now();
+      if (o.type === 'spike') {
+        // Triangular neon spike
+        const grad = ctx.createLinearGradient(o.x, o.y, o.x, o.y + o.h);
+        grad.addColorStop(0, 'hsl(0 84% 70%)');
+        grad.addColorStop(1, 'hsl(0 84% 45%)');
+        ctx.shadowColor = 'hsl(0 84% 60%)';
+        ctx.shadowBlur = 14;
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.moveTo(o.x, o.y + o.h);
+        ctx.lineTo(o.x + o.w / 2, o.y);
+        ctx.lineTo(o.x + o.w, o.y + o.h);
+        ctx.closePath();
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        // base
+        ctx.fillStyle = 'hsl(0 84% 30%)';
+        ctx.fillRect(o.x - 2, o.y + o.h - 4, o.w + 4, 4);
+      } else if (o.type === 'tall') {
+        // Tall pillar with neon stripes
+        const grad = ctx.createLinearGradient(o.x, o.y, o.x + o.w, o.y);
+        grad.addColorStop(0, 'hsl(320 90% 35%)');
+        grad.addColorStop(0.5, 'hsl(320 90% 55%)');
+        grad.addColorStop(1, 'hsl(320 90% 35%)');
+        ctx.shadowColor = 'hsl(320 90% 60%)';
+        ctx.shadowBlur = 14;
+        ctx.fillStyle = grad;
+        ctx.fillRect(o.x, o.y, o.w, o.h);
+        ctx.shadowBlur = 0;
+        // cap
+        ctx.fillStyle = 'hsl(320 90% 70%)';
+        ctx.fillRect(o.x - 2, o.y, o.w + 4, 6);
+        ctx.fillStyle = 'hsl(222 47% 5%)';
+        for (let i = 1; i < 4; i++) {
+          ctx.fillRect(o.x + 4, o.y + (o.h / 4) * i, o.w - 8, 2);
+        }
+      } else if (o.type === 'drone') {
+        // Flying drone
+        ctx.shadowColor = 'hsl(35 95% 58%)';
+        ctx.shadowBlur = 16;
+        ctx.fillStyle = 'hsl(35 95% 58%)';
+        ctx.beginPath();
+        ctx.ellipse(o.x + o.w / 2, o.y + o.h / 2, o.w / 2, o.h / 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'hsl(222 47% 5%)';
+        ctx.beginPath();
+        ctx.arc(o.x + o.w / 2, o.y + o.h / 2, o.h / 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'hsl(0 84% 60%)';
+        ctx.beginPath();
+        ctx.arc(o.x + o.w / 2, o.y + o.h / 2, 3, 0, Math.PI * 2);
+        ctx.fill();
+        // propellers
+        ctx.strokeStyle = 'hsl(35 95% 58%)';
+        ctx.lineWidth = 2;
+        const prop = Math.sin(now * 0.05) * 10;
+        ctx.beginPath();
+        ctx.moveTo(o.x - 4, o.y + 4);
+        ctx.lineTo(o.x + 4 + prop, o.y - 2);
+        ctx.moveTo(o.x + o.w + 4, o.y + 4);
+        ctx.lineTo(o.x + o.w - 4 - prop, o.y - 2);
+        ctx.stroke();
+      } else if (o.type === 'saw') {
+        // Rotating saw blade
+        ctx.shadowColor = 'hsl(190 95% 50%)';
+        ctx.shadowBlur = 16;
+        const cx = o.x + o.w / 2;
+        const cy = o.y + o.h / 2;
+        const rad = o.w / 2;
+        ctx.fillStyle = 'hsl(190 95% 50%)';
+        ctx.beginPath();
+        for (let i = 0; i < 12; i++) {
+          const a = (i / 12) * Math.PI * 2 + o.phase;
+          const rr = i % 2 === 0 ? rad : rad * 0.7;
+          const x = cx + Math.cos(a) * rr;
+          const y = cy + Math.sin(a) * rr;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'hsl(222 47% 5%)';
+        ctx.beginPath();
+        ctx.arc(cx, cy, rad * 0.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    };
+
+    const drawCoin = (c: Coin) => {
+      const now = performance.now();
+      const pulse = 1 + Math.sin(c.bob) * 0.1;
+      ctx.save();
+      ctx.shadowColor = 'hsl(35 95% 58%)';
+      ctx.shadowBlur = 16;
+      ctx.fillStyle = 'hsl(35 95% 58%)';
+      ctx.beginPath();
+      ctx.ellipse(
+        c.x,
+        c.y,
+        10 * pulse,
+        10,
+        0,
+        0,
+        Math.PI * 2,
+      );
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'hsl(35 95% 80%)';
+      ctx.beginPath();
+      ctx.ellipse(c.x - 2, c.y - 2, 5 * pulse, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // ring
+      ctx.strokeStyle = `hsl(35 95% 58% / ${0.3 + Math.sin(now * 0.008 + c.bob) * 0.2})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, 14 + Math.sin(c.bob * 1.2) * 2, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    };
+
+    const draw = () => {
+      const now = performance.now();
+      const rocketOn = now < rocketEnd;
+      const magnetOn = now < magnetEnd;
+      const slowmoOn = now < slowmoEnd;
+
       const shakeX = (Math.random() - 0.5) * cameraShake;
       const shakeY = (Math.random() - 0.5) * cameraShake;
+
+      // Sky gradient
+      const skyGrad = ctx.createLinearGradient(0, 0, 0, H);
+      skyGrad.addColorStop(0, 'hsl(222 47% 5%)');
+      skyGrad.addColorStop(0.5, 'hsl(222 50% 10%)');
+      skyGrad.addColorStop(1, 'hsl(222 55% 16%)');
+      ctx.fillStyle = skyGrad;
+      ctx.fillRect(0, 0, W, H);
 
       ctx.save();
       ctx.translate(shakeX, shakeY);
 
-      // Sky gradient - more vibrant
-      const gradient = ctx.createLinearGradient(0, 0, 0, dimensions.height);
-      gradient.addColorStop(0, '#4A90E2');
-      gradient.addColorStop(0.7, '#87CEEB');
-      gradient.addColorStop(1, '#B0E0E6');
-      ctx.fillStyle = gradient;
-      ctx.fillRect(0, 0, dimensions.width, dimensions.height);
-
-      // Draw clouds
-      clouds.forEach(cloud => {
-        drawCloud(cloud.x, cloud.y, cloud.size);
+      // Stars
+      stars.forEach((s) => {
+        const alpha = 0.4 + Math.sin(s.twinkle) * 0.4;
+        ctx.fillStyle = `hsl(190 95% 80% / ${alpha})`;
+        ctx.fillRect(s.x, s.y, s.size, s.size);
       });
 
-      // Ground with gradient
-      const groundGradient = ctx.createLinearGradient(0, GROUND_Y, 0, dimensions.height);
-      groundGradient.addColorStop(0, '#2C5F2D');
-      groundGradient.addColorStop(0.5, '#228B22');
-      groundGradient.addColorStop(1, '#1B5E20');
-      ctx.fillStyle = groundGradient;
-      ctx.fillRect(0, GROUND_Y, dimensions.width, dimensions.height - GROUND_Y);
-
-      // Ground line
-      ctx.strokeStyle = '#1B5E20';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.moveTo(0, GROUND_Y);
-      ctx.lineTo(dimensions.width, GROUND_Y);
-      ctx.stroke();
-
-      // Grass details
-      ctx.strokeStyle = 'rgba(76, 175, 80, 0.5)';
-      ctx.lineWidth = 2;
-      for (let i = 0; i < dimensions.width; i += 20) {
-        const grassHeight = 8 + Math.sin(i * 0.1) * 3;
+      // Distant mountains
+      mountains.forEach((m) => {
+        ctx.fillStyle = `hsl(222 40% ${12 + m.shade * 8}%)`;
         ctx.beginPath();
-        ctx.moveTo(i, GROUND_Y);
-        ctx.lineTo(i, GROUND_Y - grassHeight);
+        ctx.moveTo(m.x, GROUND_Y);
+        ctx.lineTo(m.x + m.w / 2, GROUND_Y - m.h);
+        ctx.lineTo(m.x + m.w, GROUND_Y);
+        ctx.closePath();
+        ctx.fill();
+        // Glow peak
+        ctx.strokeStyle = 'hsl(190 95% 50% / 0.2)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(m.x, GROUND_Y);
+        ctx.lineTo(m.x + m.w / 2, GROUND_Y - m.h);
+        ctx.lineTo(m.x + m.w, GROUND_Y);
+        ctx.stroke();
+      });
+
+      // Grid floor - perspective
+      ctx.strokeStyle = 'hsl(190 95% 50% / 0.15)';
+      ctx.lineWidth = 1;
+      const horizonY = GROUND_Y;
+      // horizontal lines
+      for (let i = 0; i < 10; i++) {
+        const y = horizonY + i * 8 + (i * i) * 0.8;
+        if (y > H) break;
+        ctx.globalAlpha = 1 - i / 10;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
         ctx.stroke();
       }
+      // vanishing lines
+      ctx.globalAlpha = 0.4;
+      const vpX = W / 2;
+      const offset = (performance.now() * 0.06) % 40;
+      for (let i = -12; i < 12; i++) {
+        ctx.beginPath();
+        ctx.moveTo(vpX + i * 40 + offset, horizonY);
+        ctx.lineTo(vpX + i * 160, H);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
 
-      // Draw particles
-      particles.forEach(p => {
+      // Horizon line
+      ctx.strokeStyle = 'hsl(190 95% 50% / 0.55)';
+      ctx.lineWidth = 2;
+      ctx.shadowColor = 'hsl(190 95% 50%)';
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.moveTo(0, GROUND_Y);
+      ctx.lineTo(W, GROUND_Y);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // Slow-mo overlay tint
+      if (slowmoOn) {
+        ctx.fillStyle = 'hsl(190 95% 50% / 0.08)';
+        ctx.fillRect(0, 0, W, H);
+      }
+      if (rocketOn) {
+        ctx.fillStyle = 'hsl(35 95% 58% / 0.08)';
+        ctx.fillRect(0, 0, W, H);
+      }
+
+      // Obstacles
+      obstacles.forEach(drawObstacle);
+
+      // Coins
+      coins.forEach(drawCoin);
+
+      // Particles
+      particles.forEach((p) => {
         ctx.globalAlpha = p.life;
         ctx.fillStyle = p.color;
         ctx.beginPath();
@@ -439,136 +915,161 @@ export default function Game2D({ isPlaying, autoJumpActive, autoJumpRemaining, o
       });
       ctx.globalAlpha = 1;
 
-      // Draw player with Base logo and glow effect
-      if (baseLogoRef.current) {
-        // Glow effect
-        ctx.shadowColor = '#0052FF';
-        ctx.shadowBlur = 20;
-        
-        // Draw Base logo
-        ctx.drawImage(
-          baseLogoRef.current,
-          player.x,
-          player.y,
-          player.width,
-          player.height
-        );
-        
-        ctx.shadowBlur = 0;
-
-        // Jump trail effect
-        if (isJumping) {
-          ctx.globalAlpha = 0.3;
-          ctx.drawImage(
-            baseLogoRef.current,
-            player.x - 5,
-            player.y + 5,
-            player.width,
-            player.height
-          );
-          ctx.globalAlpha = 1;
-        }
-      } else {
-        // Fallback: Blue square with Base colors
-        ctx.fillStyle = '#0052FF';
-        ctx.shadowColor = '#0052FF';
-        ctx.shadowBlur = 20;
-        ctx.fillRect(player.x, player.y, player.width, player.height);
-        ctx.shadowBlur = 0;
-      }
-
-      // Draw obstacles with gradient and depth
-      obstacles.forEach((obstacle: Obstacle) => {
-        // Shadow
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
-        ctx.fillRect(obstacle.x + 5, obstacle.y + 5, obstacle.width, obstacle.height);
-
-        // Main obstacle with gradient
-        const obstacleGradient = ctx.createLinearGradient(
-          obstacle.x, 
-          obstacle.y, 
-          obstacle.x + obstacle.width, 
-          obstacle.y
-        );
-        obstacleGradient.addColorStop(0, '#FF3B30');
-        obstacleGradient.addColorStop(1, '#DC143C');
-        ctx.fillStyle = obstacleGradient;
-        ctx.fillRect(obstacle.x, obstacle.y, obstacle.width, obstacle.height);
-
-        // Highlight
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
-        ctx.fillRect(obstacle.x, obstacle.y, obstacle.width * 0.3, obstacle.height);
-      });
-
-      // Auto-jump overlay
-      if (autoJumpActiveRef.current && autoJumpRemainingRef.current > 0) {
-        ctx.fillStyle = 'rgba(255, 215, 0, 0.15)';
-        ctx.fillRect(0, 0, dimensions.width, dimensions.height);
-        
-        // Pulsing border
-        const pulseAlpha = 0.5 + Math.sin(Date.now() * 0.005) * 0.3;
-        ctx.strokeStyle = `rgba(255, 215, 0, ${pulseAlpha})`;
-        ctx.lineWidth = 4;
-        ctx.strokeRect(2, 2, dimensions.width - 4, dimensions.height - 4);
-        
-        // Auto-jump indicator with remaining count
-        ctx.fillStyle = '#FFD700';
-        ctx.font = 'bold 18px Arial';
-        ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
-        ctx.shadowBlur = 5;
-        ctx.fillText(`⚡ AUTO-JUMP: ${autoJumpRemainingRef.current} left`, dimensions.width - 220, 30);
-        ctx.shadowBlur = 0;
-      }
-
-      // Score/Auto-jump popup animation
-      if (scorePopup) {
-        ctx.globalAlpha = scorePopup.opacity;
-        ctx.fillStyle = '#FFD700';
-        ctx.font = 'bold 24px Arial';
-        ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
-        ctx.shadowBlur = 5;
-        const text = autoJumpActiveRef.current ? `${scorePopup.value} jumps left` : `+${scorePopup.value}`;
-        ctx.fillText(text, dimensions.width / 2 - 60, scorePopup.y);
-        ctx.shadowBlur = 0;
-        ctx.globalAlpha = 1;
-      }
+      // Player
+      drawPlayer();
 
       ctx.restore();
-    };
 
-    const gameLoop = (): void => {
-      update();
-      draw();
-      if (gameActive) {
-        animationId = requestAnimationFrame(gameLoop);
+      // HUD - power-up badges
+      const activeBadges: { sym: string; label: string; color: string; val: string }[] = [];
+      if (shieldActive)
+        activeBadges.push({ sym: 'S', label: 'SHIELD', color: 'hsl(190 95% 50%)', val: '' });
+      if (djRemaining > 0)
+        activeBadges.push({
+          sym: '2',
+          label: 'DOUBLE',
+          color: 'hsl(145 70% 50%)',
+          val: `×${djRemaining}`,
+        });
+      if (magnetOn) {
+        activeBadges.push({
+          sym: 'M',
+          label: 'MAGNET',
+          color: 'hsl(320 90% 60%)',
+          val: `${Math.ceil((magnetEnd - now) / 1000)}s`,
+        });
+      }
+      if (slowmoOn) {
+        activeBadges.push({
+          sym: 'T',
+          label: 'SLOW',
+          color: 'hsl(190 95% 50%)',
+          val: `${Math.ceil((slowmoEnd - now) / 1000)}s`,
+        });
+      }
+      if (rocketOn) {
+        activeBadges.push({
+          sym: 'R',
+          label: 'ROCKET',
+          color: 'hsl(35 95% 58%)',
+          val: `${Math.ceil((rocketEnd - now) / 1000)}s`,
+        });
+      }
+      if (autoJumpRemaining > 0) {
+        activeBadges.push({
+          sym: 'A',
+          label: 'AUTO',
+          color: 'hsl(145 70% 50%)',
+          val: `×${autoJumpRemaining}`,
+        });
+      }
+
+      const roundedRect = (
+        x: number,
+        y: number,
+        w: number,
+        h: number,
+        r: number,
+      ) => {
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + w - r, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        ctx.lineTo(x + r, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+        ctx.lineTo(x, y + r);
+        ctx.quadraticCurveTo(x, y, x + r, y);
+        ctx.closePath();
+      };
+
+      ctx.font = 'bold 11px ui-sans-serif, system-ui';
+      activeBadges.forEach((b, i) => {
+        const x = 14;
+        const y = 14 + i * 30;
+        const text = `${b.label}${b.val ? ' ' + b.val : ''}`;
+        const w = ctx.measureText(text).width + 40;
+        ctx.fillStyle = 'hsl(222 40% 8% / 0.85)';
+        ctx.strokeStyle = b.color;
+        ctx.lineWidth = 1;
+        roundedRect(x, y, w, 22, 6);
+        ctx.fill();
+        ctx.stroke();
+        // icon square
+        ctx.fillStyle = b.color;
+        roundedRect(x + 4, y + 4, 14, 14, 3);
+        ctx.fill();
+        ctx.fillStyle = 'hsl(222 47% 5%)';
+        ctx.fillText(b.sym, x + 8, y + 14);
+        ctx.fillStyle = b.color;
+        ctx.fillText(text, x + 24, y + 14);
+      });
+
+      // Pause overlay
+      if (pausedRef.current) {
+        ctx.fillStyle = 'hsl(222 47% 5% / 0.75)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = 'hsl(190 95% 50%)';
+        ctx.font = 'bold 48px ui-sans-serif, system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText('PAUSED', W / 2, H / 2);
+        ctx.font = 'bold 14px ui-sans-serif, system-ui';
+        ctx.fillStyle = 'hsl(210 20% 96%)';
+        ctx.fillText('Use the shop to buy more power-ups', W / 2, H / 2 + 28);
+        ctx.textAlign = 'start';
       }
     };
 
-    canvas.addEventListener('click', handleInput);
-    canvas.addEventListener('touchstart', handleInput);
+    const loop = (t: number) => {
+      lastTime = t;
+      if (!pausedRef.current && gameActive) {
+        update();
+      }
+      draw();
+      if (gameActive) animId = requestAnimationFrame(loop);
+    };
 
-    spawnObstacle();
-    gameLoop();
+    animId = requestAnimationFrame(loop);
 
     return () => {
-      canvas.removeEventListener('click', handleInput);
-      canvas.removeEventListener('touchstart', handleInput);
-      cancelAnimationFrame(animationId);
+      cancelAnimationFrame(animId);
+      canvas.removeEventListener('mousedown', onDown);
+      canvas.removeEventListener('mouseup', onUp);
+      canvas.removeEventListener('touchstart', onDown);
+      canvas.removeEventListener('touchend', onUp);
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keyup', onKeyUp);
     };
-  }, [isPlaying, dimensions]); // Only restart game when isPlaying or dimensions change
+  }, [isPlaying, dimensions, playSound, onPause]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={dimensions.width}
-      height={dimensions.height}
-      className="border-4 border-blue-600 rounded-xl shadow-2xl cursor-pointer bg-white"
-      style={{ 
-        touchAction: 'none',
-        maxWidth: '100%',
-        height: 'auto',
-        boxShadow: '0 0 30px rgba(0, 82, 255, 0.4)'
-      }}
-    />
+    <div className="relative w-full" style={{ maxWidth: dimensions.width }}>
+      <canvas
+        ref={canvasRef}
+        width={dimensions.width}
+        height={dimensions.height}
+        className="neon-border w-full rounded-2xl bg-background cursor-pointer"
+        style={{ touchAction: 'none', display: 'block' }}
+      />
+
+      {/* Top HUD buttons */}
+      <div className="pointer-events-none absolute right-3 top-3 flex gap-2">
+        <button
+          onClick={onHome}
+          className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-lg border border-primary/30 bg-surface-1/80 text-primary backdrop-blur-md transition-all hover:border-primary hover:bg-surface-2 active:scale-95"
+          aria-label="Home"
+        >
+          <Home className="h-4 w-4" />
+        </button>
+        <button
+          onClick={onPause}
+          className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-lg border border-primary/30 bg-surface-1/80 text-primary backdrop-blur-md transition-all hover:border-primary hover:bg-surface-2 active:scale-95"
+          aria-label={paused ? 'Resume' : 'Pause'}
+        >
+          {paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
+        </button>
+      </div>
+    </div>
   );
 }
