@@ -2,10 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
-import { ArrowLeftRight, Coins, Play, RotateCcw, Trophy, Home as HomeIcon, Zap } from 'lucide-react';
+import { ArrowLeftRight, Play, RotateCcw, Trophy, Home as HomeIcon, Zap } from 'lucide-react';
 import WalletButton from '@/components/WalletButton';
 import SwapModal from '@/components/SwapModal';
-import PowerUpShop, { useEthPowerUpPurchase } from '@/components/PowerUpShop';
+import PowerUpShop, { JumpDot } from '@/components/PowerUpShop';
 import {
   POWERUPS,
   EMPTY_INVENTORY,
@@ -15,9 +15,13 @@ import {
 
 const Game2D = dynamic(() => import('@/components/Game2D'), { ssr: false });
 
-const COINS_STORAGE = 'jumparun:coins';
+const JUMP_STORAGE = 'jumparun:jump';
 const INVENTORY_STORAGE = 'jumparun:inventory';
+const QUEUE_STORAGE = 'jumparun:queue';
 const HIGHSCORE_STORAGE = 'jumparun:highscore';
+
+/** Starter JUMP given to a brand-new player so they can sample a power-up. */
+const STARTER_JUMP = 1500;
 
 type View = 'home' | 'playing' | 'gameover';
 
@@ -26,29 +30,38 @@ export default function Home() {
   const [paused, setPaused] = useState(false);
   const [score, setScore] = useState(0);
   const [highScore, setHighScore] = useState(0);
-  const [coinBank, setCoinBank] = useState(0);
-  const [runCoins, setRunCoins] = useState(0);
+  const [jumpBank, setJumpBank] = useState(0);
+  const [runJump, setRunJump] = useState(0);
   const [inventory, setInventory] = useState<PowerUpInventory>(EMPTY_INVENTORY);
+  const [queue, setQueue] = useState<PowerUpId[]>([]);
   const [swapOpen, setSwapOpen] = useState(false);
 
-  // Load saved state
   useEffect(() => {
     try {
-      const c = Number(localStorage.getItem(COINS_STORAGE) ?? '0');
-      if (!Number.isNaN(c)) setCoinBank(c);
+      const raw = localStorage.getItem(JUMP_STORAGE);
+      if (raw === null) {
+        // first-time player — give them a small starter balance
+        localStorage.setItem(JUMP_STORAGE, String(STARTER_JUMP));
+        setJumpBank(STARTER_JUMP);
+      } else {
+        const v = Number(raw);
+        if (!Number.isNaN(v)) setJumpBank(v);
+      }
       const hs = Number(localStorage.getItem(HIGHSCORE_STORAGE) ?? '0');
       if (!Number.isNaN(hs)) setHighScore(hs);
       const inv = localStorage.getItem(INVENTORY_STORAGE);
       if (inv) setInventory({ ...EMPTY_INVENTORY, ...JSON.parse(inv) });
+      const q = localStorage.getItem(QUEUE_STORAGE);
+      if (q) setQueue(JSON.parse(q));
     } catch {
       /* ignore */
     }
   }, []);
 
-  const persistCoins = useCallback((v: number) => {
-    setCoinBank(v);
+  const persistJump = useCallback((v: number) => {
+    setJumpBank(v);
     try {
-      localStorage.setItem(COINS_STORAGE, String(v));
+      localStorage.setItem(JUMP_STORAGE, String(v));
     } catch {
       /* ignore */
     }
@@ -58,6 +71,15 @@ export default function Home() {
     setInventory(inv);
     try {
       localStorage.setItem(INVENTORY_STORAGE, JSON.stringify(inv));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const persistQueue = useCallback((q: PowerUpId[]) => {
+    setQueue(q);
+    try {
+      localStorage.setItem(QUEUE_STORAGE, JSON.stringify(q));
     } catch {
       /* ignore */
     }
@@ -73,72 +95,81 @@ export default function Home() {
   }, []);
 
   const handleGameOver = useCallback(
-    (finalScore: number, coinsFromRun: number) => {
-      const newCoins = coinBank + coinsFromRun;
-      persistCoins(newCoins);
+    (finalScore: number, jumpFromRun: number) => {
+      persistJump(jumpBank + jumpFromRun);
       if (finalScore > highScore) persistHighScore(finalScore);
+      // Clear inventory + queue — power-ups were consumed during the run
+      persistInventory(EMPTY_INVENTORY);
+      persistQueue([]);
       setView('gameover');
       setPaused(false);
     },
-    [coinBank, highScore, persistCoins, persistHighScore],
+    [jumpBank, highScore, persistJump, persistHighScore, persistInventory, persistQueue],
   );
 
   const handleScoreUpdate = useCallback((s: number) => setScore(s), []);
-  const handleCoinCollected = useCallback((total: number) => setRunCoins(total), []);
+  const handleJumpCollected = useCallback((total: number) => setRunJump(total), []);
 
-  const handleConsumePowerUp = useCallback(
-    (id: PowerUpId) => {
-      persistInventory({ ...inventory, [id]: Math.max(0, inventory[id] - 1) });
-    },
-    [inventory, persistInventory],
-  );
+  // Called by the game when it consumes a power-up charge.
+  const handleConsumePowerUp = useCallback((id: PowerUpId) => {
+    setInventory((prev) => {
+      const next = { ...prev, [id]: Math.max(0, prev[id] - 1) };
+      try {
+        localStorage.setItem(INVENTORY_STORAGE, JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+    setQueue((prev) => {
+      const idx = prev.indexOf(id);
+      if (idx === -1) return prev;
+      const next = [...prev.slice(0, idx), ...prev.slice(idx + 1)];
+      try {
+        localStorage.setItem(QUEUE_STORAGE, JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
 
-  const buyWithCoins = useCallback(
+  const buyPowerUp = useCallback(
     (id: PowerUpId): boolean => {
       const def = POWERUPS[id];
-      if (coinBank < def.coinCost) return false;
-      persistCoins(coinBank - def.coinCost);
+      if (jumpBank < def.cost) return false;
+      persistJump(jumpBank - def.cost);
       persistInventory({ ...inventory, [id]: inventory[id] + 1 });
+      persistQueue([...queue, id]);
       return true;
     },
-    [coinBank, inventory, persistCoins, persistInventory],
+    [jumpBank, inventory, queue, persistJump, persistInventory, persistQueue],
   );
-
-  const grantPowerUp = useCallback(
-    (id: PowerUpId) => {
-      persistInventory({ ...inventory, [id]: inventory[id] + 1 });
-    },
-    [inventory, persistInventory],
-  );
-
-  const { buy: buyWithEth } = useEthPowerUpPurchase(grantPowerUp);
 
   const startGame = useCallback(() => {
     setScore(0);
-    setRunCoins(0);
+    setRunJump(0);
     setPaused(false);
     setView('playing');
   }, []);
 
   const goHome = useCallback(() => {
-    // Save coins collected in the current run
-    if (runCoins > 0) {
-      persistCoins(coinBank + runCoins);
-      setRunCoins(0);
+    if (runJump > 0) {
+      persistJump(jumpBank + runJump);
+      setRunJump(0);
     }
     if (score > highScore) persistHighScore(score);
     setView('home');
     setPaused(false);
-  }, [runCoins, coinBank, persistCoins, score, highScore, persistHighScore]);
+  }, [runJump, jumpBank, persistJump, score, highScore, persistHighScore]);
 
-  const totalCoinsDisplay = useMemo(
-    () => coinBank + (view === 'playing' ? runCoins : 0),
-    [coinBank, runCoins, view],
+  const totalJumpDisplay = useMemo(
+    () => jumpBank + (view === 'playing' ? runJump : 0),
+    [jumpBank, runJump, view],
   );
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-background text-foreground">
-      {/* Background decoration */}
       <div className="pointer-events-none fixed inset-0">
         <div className="absolute inset-0 grid-bg opacity-40" />
         <div className="absolute left-1/2 top-0 h-[600px] w-[900px] -translate-x-1/2 rounded-full bg-primary/10 blur-[120px]" />
@@ -146,7 +177,6 @@ export default function Home() {
       </div>
 
       <div className="relative mx-auto flex max-w-6xl flex-col px-4 pb-10 pt-5">
-        {/* Top bar */}
         <header className="mb-5 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="relative">
@@ -169,7 +199,7 @@ export default function Home() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => setSwapOpen(true)}
-              className="group hidden items-center gap-2 rounded-xl border border-accent/30 bg-accent/10 px-3 py-2 transition-all hover:border-accent/60 hover:bg-accent/20 sm:inline-flex"
+              className="hidden items-center gap-2 rounded-xl border border-accent/30 bg-accent/10 px-3 py-2 transition-all hover:border-accent/60 hover:bg-accent/20 sm:inline-flex"
             >
               <ArrowLeftRight className="h-4 w-4 text-accent" />
               <span className="font-display text-xs font-bold text-accent">Swap $JUMP</span>
@@ -178,7 +208,6 @@ export default function Home() {
           </div>
         </header>
 
-        {/* Stat bar */}
         <div className="mb-4 grid grid-cols-3 gap-2">
           <StatChip
             icon={<Trophy className="h-4 w-4 text-primary" />}
@@ -187,9 +216,9 @@ export default function Home() {
             accent="primary"
           />
           <StatChip
-            icon={<Coins className="h-4 w-4 text-accent" />}
-            label="Coins"
-            value={totalCoinsDisplay.toLocaleString()}
+            icon={<JumpDot className="text-accent" />}
+            label="$JUMP"
+            value={totalJumpDisplay.toLocaleString()}
             accent="accent"
           />
           <StatChip
@@ -200,16 +229,16 @@ export default function Home() {
           />
         </div>
 
-        {/* Main content */}
         {view === 'playing' ? (
           <div className="flex flex-col items-center gap-4">
             <Game2D
               isPlaying
               paused={paused}
               inventory={inventory}
+              queue={queue}
               onGameOver={handleGameOver}
               onScoreUpdate={handleScoreUpdate}
-              onCoinCollected={handleCoinCollected}
+              onJumpCollected={handleJumpCollected}
               onConsumePowerUp={handleConsumePowerUp}
               onPause={() => setPaused((p) => !p)}
               onHome={goHome}
@@ -218,7 +247,7 @@ export default function Home() {
             {paused && (
               <div className="glass w-full max-w-[960px] rounded-2xl p-4">
                 <div className="mb-3 flex items-center justify-between">
-                  <h3 className="font-display text-lg font-bold">Quick Shop</h3>
+                  <h3 className="font-display text-base font-bold">Quick Shop</h3>
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => setPaused(false)}
@@ -237,18 +266,15 @@ export default function Home() {
                   </div>
                 </div>
                 <PowerUpShop
-                  coins={coinBank}
+                  balance={jumpBank}
                   inventory={inventory}
-                  onBuyWithCoins={buyWithCoins}
-                  onBuyWithEth={buyWithEth}
-                  compact
+                  onBuy={buyPowerUp}
                 />
               </div>
             )}
           </div>
         ) : (
           <div className="grid gap-4 lg:grid-cols-[1.3fr_1fr]">
-            {/* Hero card */}
             <div className="glass relative overflow-hidden rounded-2xl p-6 sm:p-8">
               <div className="pointer-events-none absolute -right-20 -top-20 h-60 w-60 rounded-full bg-primary/20 blur-3xl" />
               <div className="pointer-events-none absolute -bottom-20 -left-20 h-60 w-60 rounded-full bg-accent/20 blur-3xl" />
@@ -271,15 +297,15 @@ export default function Home() {
                       </span>
                     </p>
                     {score > 0 && score === highScore && (
-                      <p className="mt-2 font-display text-sm font-bold text-accent animate-float">
+                      <p className="animate-float mt-2 font-display text-sm font-bold text-accent">
                         ◆ NEW HIGH SCORE ◆
                       </p>
                     )}
                   </div>
 
                   <div className="grid grid-cols-2 gap-3">
-                    <MiniStat label="Coins this run" value={runCoins.toString()} />
-                    <MiniStat label="Bank total" value={coinBank.toString()} />
+                    <MiniStat label="$JUMP earned" value={runJump.toLocaleString()} />
+                    <MiniStat label="Bank total" value={jumpBank.toLocaleString()} />
                   </div>
 
                   <div className="flex flex-wrap gap-3">
@@ -308,12 +334,13 @@ export default function Home() {
                     </span>
                   </div>
                   <div>
-                    <h2 className="font-display text-4xl font-black leading-tight tracking-tight sm:text-5xl text-balance">
-                      Jump. Dash. <span className="text-primary">Survive.</span>
+                    <h2 className="font-display text-4xl font-black leading-tight tracking-tight text-balance sm:text-5xl">
+                      Jump. Survive. <span className="text-primary">Stack $JUMP.</span>
                     </h2>
                     <p className="mt-3 max-w-md text-sm leading-relaxed text-muted-foreground">
-                      Tap, click or press space to jump. Hold for higher jumps. Collect coins, chain
-                      power-ups, and outrun obstacles across the grid.
+                      Tap or press Space to jump. Hold for a higher jump. Grab $JUMP tokens on
+                      the way, and spend them on power-ups that activate one at a time —
+                      in the order you buy them.
                     </p>
                   </div>
 
@@ -321,7 +348,7 @@ export default function Home() {
                     <Tip label="Tap" value="Jump" />
                     <Tip label="Hold" value="Higher" />
                     <Tip label="P" value="Pause" />
-                    <Tip label="Shop" value="Buy PU" />
+                    <Tip label="Shop" value="Buy P-Ups" />
                   </div>
 
                   <div className="flex flex-wrap gap-3">
@@ -341,11 +368,28 @@ export default function Home() {
                       Swap $JUMP
                     </button>
                   </div>
+
+                  {queue.length > 0 && (
+                    <div className="rounded-xl border border-primary/20 bg-surface-2 p-3">
+                      <p className="mb-1.5 font-display text-[10px] font-bold uppercase tracking-wider text-primary">
+                        Queued for next run ({queue.length})
+                      </p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {queue.map((id, idx) => (
+                          <span
+                            key={idx}
+                            className="rounded-md border border-border bg-surface-3 px-2 py-0.5 font-display text-[10px] font-bold text-foreground"
+                          >
+                            {idx + 1}. {POWERUPS[id].short}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
 
-            {/* Side: swap promo + shop */}
             <div className="flex flex-col gap-4">
               <button
                 onClick={() => setSwapOpen(true)}
@@ -381,17 +425,15 @@ export default function Home() {
 
               <div className="glass rounded-2xl p-5">
                 <PowerUpShop
-                  coins={coinBank}
+                  balance={jumpBank}
                   inventory={inventory}
-                  onBuyWithCoins={buyWithCoins}
-                  onBuyWithEth={buyWithEth}
+                  onBuy={buyPowerUp}
                 />
               </div>
             </div>
           </div>
         )}
 
-        {/* Footer tip */}
         <p className="mt-6 text-center text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
           Powered by Base · $JUMP · 0x9649…f07e
         </p>
@@ -455,4 +497,3 @@ function Tip({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
-
