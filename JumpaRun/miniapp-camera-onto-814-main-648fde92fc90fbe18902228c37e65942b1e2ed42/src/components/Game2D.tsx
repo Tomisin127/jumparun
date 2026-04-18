@@ -16,6 +16,23 @@ export interface Game2DProps {
   onHome: () => void;
 }
 
+/**
+ * Simple endless runner:
+ *   - Tap / Space / ArrowUp: jump.  Hold for a slightly higher jump.
+ *   - Avoid red ground obstacles and magenta flying drones.
+ *   - Collect amber $JUMP tokens for bonus currency.
+ *   - Score = distance survived.
+ *
+ *   Power-ups are consumed from inventory at game start and active throughout:
+ *     - shield:      absorbs one hit (charges count = uses)
+ *     - doubleJump:  enables a second mid-air jump (charges count = uses)
+ *     - autoJump:    auto-jumps when obstacle is close (charges count = uses)
+ *     - magnet:      tokens pull toward you for the whole run if in inventory
+ *     - slowmo:      obstacle/world speed is halved for the whole run if in inventory
+ *     - rocket:      invincible flight for 5s at game start if in inventory
+ *
+ *   Anything consumed is reported via onConsumePowerUp(id) once at game start.
+ */
 export default function Game2D({
   isPlaying,
   paused,
@@ -28,9 +45,9 @@ export default function Game2D({
   onHome,
 }: Game2DProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 360 });
+  const [dimensions, setDimensions] = useState({ width: 800, height: 340 });
 
-  // Keep latest callbacks/state in refs so the game loop closure never goes stale
+  // Keep latest callbacks/state in refs so the game-loop closure never goes stale.
   const cbRef = useRef({ onGameOver, onScoreUpdate, onJumpCollected, onConsumePowerUp });
   const pausedRef = useRef(paused);
   const inventoryRef = useRef(inventory);
@@ -41,208 +58,231 @@ export default function Game2D({
   useEffect(() => { pausedRef.current = paused; }, [paused]);
   useEffect(() => { inventoryRef.current = inventory; }, [inventory]);
 
+  // Responsive canvas
   useEffect(() => {
     const resize = () => {
       const w = Math.min(window.innerWidth - 16, 900);
-      const h = Math.round(w * 0.42);
-      setDimensions({ width: w, height: Math.max(h, 260) });
+      const h = Math.round(Math.max(260, Math.min(w * 0.46, 420)));
+      setDimensions({ width: w, height: h });
     };
     resize();
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
   }, []);
 
-  // Stable sound helper (doesn't depend on game state)
+  // Audio context (lazy-initialized on first interaction)
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const playSound = useCallback((type: 'jump' | 'coin' | 'hit' | 'powerup') => {
+  const playSound = useCallback((type: 'jump' | 'coin' | 'hit' | 'power') => {
+    const ac = audioCtxRef.current;
+    if (!ac) return;
     try {
-      if (!audioCtxRef.current) return;
-      const ac = audioCtxRef.current;
       const osc = ac.createOscillator();
       const g = ac.createGain();
-      osc.connect(g); g.connect(ac.destination);
+      osc.connect(g);
+      g.connect(ac.destination);
       const t = ac.currentTime;
       if (type === 'jump') {
-        osc.frequency.setValueAtTime(400, t);
-        osc.frequency.exponentialRampToValueAtTime(800, t + 0.12);
-        g.gain.setValueAtTime(0.1, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
-        osc.start(t); osc.stop(t + 0.12);
+        osc.frequency.setValueAtTime(420, t);
+        osc.frequency.exponentialRampToValueAtTime(780, t + 0.1);
+        g.gain.setValueAtTime(0.08, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+        osc.start(t); osc.stop(t + 0.11);
       } else if (type === 'coin') {
         osc.type = 'square';
-        osc.frequency.setValueAtTime(880, t);
-        osc.frequency.exponentialRampToValueAtTime(1320, t + 0.09);
-        g.gain.setValueAtTime(0.06, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
-        osc.start(t); osc.stop(t + 0.1);
+        osc.frequency.setValueAtTime(900, t);
+        osc.frequency.exponentialRampToValueAtTime(1320, t + 0.08);
+        g.gain.setValueAtTime(0.05, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+        osc.start(t); osc.stop(t + 0.09);
       } else if (type === 'hit') {
         osc.type = 'sawtooth';
         osc.frequency.setValueAtTime(240, t);
-        osc.frequency.exponentialRampToValueAtTime(55, t + 0.35);
-        g.gain.setValueAtTime(0.15, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
-        osc.start(t); osc.stop(t + 0.35);
+        osc.frequency.exponentialRampToValueAtTime(60, t + 0.3);
+        g.gain.setValueAtTime(0.12, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+        osc.start(t); osc.stop(t + 0.3);
       } else {
         osc.type = 'triangle';
         osc.frequency.setValueAtTime(500, t);
-        osc.frequency.exponentialRampToValueAtTime(1000, t + 0.18);
-        g.gain.setValueAtTime(0.1, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-        osc.start(t); osc.stop(t + 0.2);
+        osc.frequency.exponentialRampToValueAtTime(1000, t + 0.15);
+        g.gain.setValueAtTime(0.08, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+        osc.start(t); osc.stop(t + 0.16);
       }
     } catch { /* ignore */ }
   }, []);
 
-  // Main game loop — restarts every time isPlaying flips on or dimensions change
+  // ── Main loop ──────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !isPlaying) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Init audio on first user interaction (canvas click/touch starts it)
     if (!audioCtxRef.current) {
       try {
-        audioCtxRef.current = new (
+        const AC =
           window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-        )();
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        audioCtxRef.current = new AC();
       } catch { /* ignore */ }
     }
 
     const W = dimensions.width;
     const H = dimensions.height;
-    const GROUND = H - 60;       // y where ground surface is
-    const PLAYER_W = 38;
-    const PLAYER_H = 44;
+    const GROUND_Y = H - 56;
 
-    // ── Physics constants ─────────────────────────────────────────────
-    const GRAVITY = 0.55;
-    const JUMP_FORCE = -13;
-    const HOLD_BONUS = -0.4;     // extra vy each frame while holding, up to MAX_HOLD frames
-    const MAX_HOLD_FRAMES = 10;
-    const TERMINAL_VEL = 18;
-
-    // ── Game state (plain variables — no React setState inside loop) ──
-    let alive = true;
-    let score = 0;
-    let jumpTokens = 0;          // earned this run
-    let speed = 4.2;             // pixels/frame at 60fps equivalent
-    const SPEED_MAX = 9;
-    const SPEED_RAMP = 0.0008;   // added each frame
-
-    // ── Player ────────────────────────────────────────────────────────
-    const p = { x: 90, y: GROUND - PLAYER_H, vy: 0, onGround: true, jumpsLeft: 1 };
-
-    // ── Power-up state (read from inventory at game start, then local) ─
-    let shieldLeft = inventoryRef.current.shield;
-    let djLeft = inventoryRef.current.doubleJump;       // extra mid-air jumps
-    let autoLeft = inventoryRef.current.autoJump;
-    let magnetActive = false;
-    let magnetEnd = 0;
-    let slowmoActive = false;
-    let slowmoEnd = 0;
-    let rocketActive = false;
-    let rocketEnd = 0;
-
-    // Consume passive power-ups from inventory immediately
-    for (let i = 0; i < inventoryRef.current.shield; i++) cbRef.current.onConsumePowerUp('shield');
-    for (let i = 0; i < inventoryRef.current.doubleJump; i++) cbRef.current.onConsumePowerUp('doubleJump');
-    for (let i = 0; i < inventoryRef.current.autoJump; i++) cbRef.current.onConsumePowerUp('autoJump');
-
-    // Timed power-ups: activate them sequentially
-    // Build a queue from inventory at game start
-    type TimedId = 'magnet' | 'slowmo' | 'rocket';
-    const TIMED_DUR: Record<TimedId, number> = { magnet: 12000, slowmo: 8000, rocket: 5000 };
-    const timedQ: TimedId[] = [];
-    (['magnet', 'slowmo', 'rocket'] as TimedId[]).forEach((id) => {
-      for (let i = 0; i < inventoryRef.current[id]; i++) timedQ.push(id);
-      for (let i = 0; i < inventoryRef.current[id]; i++) cbRef.current.onConsumePowerUp(id);
-    });
-    let timedQueueStarted = false;
-    const TIMED_GRACE_MS = 2000; // wait before first activation
-    let gameStartTime = 0;
-
-    const activateNextTimed = (now: number) => {
-      const next = timedQ.shift();
-      if (!next) return;
-      const end = now + TIMED_DUR[next];
-      if (next === 'magnet') { magnetActive = true; magnetEnd = end; }
-      else if (next === 'slowmo') { slowmoActive = true; slowmoEnd = end; }
-      else if (next === 'rocket') { rocketActive = true; rocketEnd = end; }
-      playSound('powerup');
+    // ── Player ─────────────────────────────────────────────────────────
+    const PW = 36;
+    const PH = 42;
+    const player = {
+      x: 80,
+      y: GROUND_Y - PH,
+      vy: 0,
+      onGround: true,
+      dj: false,           // has an unused double-jump for this airborne period
     };
 
-    // ── Obstacles ─────────────────────────────────────────────────────
-    interface Obs { x: number; y: number; w: number; h: number; phase: number; drone: boolean }
-    let obstacles: Obs[] = [];
-    let distSinceObs = 0;
-    // Minimum gap scales with speed so game stays readable
-    const obsGap = () => Math.max(260, 420 - speed * 12) + Math.random() * 120;
+    // ── Physics constants ──────────────────────────────────────────────
+    // Expressed per-frame-at-60fps so we can scale by normalized dt.
+    const GRAVITY = 0.78;
+    const GRAVITY_HOLD = 0.42;   // softer gravity while holding jump and ascending
+    const JUMP_VY = -13.0;
+    const DJ_VY   = -11.5;
+    const MAX_FALL = 18;
 
-    const spawnObs = () => {
-      const drone = Math.random() < 0.2;
-      if (drone) {
+    // ── World ──────────────────────────────────────────────────────────
+    // Start slow and ramp gradually so the game is actually playable.
+    let speed = 4.8;
+    const SPEED_MAX = 9.5;
+    const SPEED_RAMP = 0.0006; // per-frame @60fps
+
+    // ── Snapshot power-ups from inventory at game start ────────────────
+    const inv = inventoryRef.current;
+    let shieldCharges = inv.shield;
+    let djCharges = inv.doubleJump;
+    let autoCharges = inv.autoJump;
+    const magnetActive = inv.magnet > 0;
+    const slowmoActive = inv.slowmo > 0;
+    let rocketLeftMs = inv.rocket > 0 ? 5000 : 0;
+
+    // Report consumption to React (inventory clears, balance is server-of-truth).
+    const consumeStart = () => {
+      const invSnap = inventoryRef.current;
+      for (let i = 0; i < invSnap.shield; i++)     cbRef.current.onConsumePowerUp('shield');
+      for (let i = 0; i < invSnap.doubleJump; i++) cbRef.current.onConsumePowerUp('doubleJump');
+      for (let i = 0; i < invSnap.autoJump; i++)   cbRef.current.onConsumePowerUp('autoJump');
+      for (let i = 0; i < invSnap.magnet; i++)     cbRef.current.onConsumePowerUp('magnet');
+      for (let i = 0; i < invSnap.slowmo; i++)     cbRef.current.onConsumePowerUp('slowmo');
+      for (let i = 0; i < invSnap.rocket; i++)     cbRef.current.onConsumePowerUp('rocket');
+    };
+    consumeStart();
+
+    // Apply slowmo by scaling speed (works for the whole run)
+    const speedMultiplier = () => (rocketLeftMs > 0 ? 1.6 : slowmoActive ? 0.55 : 1);
+
+    // ── Entities ───────────────────────────────────────────────────────
+    interface Obstacle {
+      x: number; y: number; w: number; h: number;
+      kind: 'spike' | 'drone';
+      baseY: number; // for drones (bob reference)
+      phase: number;
+    }
+    interface Token { x: number; y: number; taken: boolean; bob: number }
+
+    let obstacles: Obstacle[] = [];
+    let tokens: Token[] = [];
+
+    // Pixel distance since last spawn — decoupled from wall-clock so pause is safe.
+    let distSinceObstacle = 0;
+    let distSinceToken = 0;
+
+    const spawnObstacle = () => {
+      const isDrone = Math.random() < 0.22;
+      if (isDrone) {
+        const baseY = GROUND_Y - 90 - Math.random() * 30;
         obstacles.push({
-          x: W + 30, w: 48, h: 26,
-          y: GROUND - 100 - Math.random() * 40,
-          phase: 0, drone: true,
+          kind: 'drone',
+          x: W + 30,
+          y: baseY,
+          baseY,
+          w: 44,
+          h: 24,
+          phase: Math.random() * Math.PI * 2,
         });
       } else {
-        const tall = Math.random() < 0.3;
-        const h = tall ? 66 : 38;
-        obstacles.push({ x: W + 30, w: 26, h, y: GROUND - h, phase: 0, drone: false });
+        // Ground obstacles vary in height a little.
+        const tall = Math.random() < 0.25;
+        const h = tall ? 58 : 34;
+        const w = 24 + Math.random() * 14;
+        obstacles.push({
+          kind: 'spike',
+          x: W + 30,
+          y: GROUND_Y - h,
+          baseY: GROUND_Y - h,
+          w,
+          h,
+          phase: 0,
+        });
       }
     };
 
-    // ── Tokens ($JUMP) ─────────────────────────────────────────────────
-    interface Tok { x: number; y: number; bob: number; taken: boolean }
-    let tokens: Tok[] = [];
-    let distSinceTok = 0;
-    const tokGap = () => 460 + Math.random() * 280;
-
-    const spawnToks = () => {
-      const baseX = W + 50;
-      const low = Math.random() < 0.5;
-      for (let i = 0; i < 4; i++) {
+    const spawnTokens = () => {
+      const base = W + 30;
+      const low = Math.random() < 0.4;
+      const count = 3 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < count; i++) {
         tokens.push({
-          x: baseX + i * 38,
-          y: low ? GROUND - 34 : GROUND - 95 - Math.sin((i / 3) * Math.PI) * 30,
-          bob: i * 0.5,
+          x: base + i * 36,
+          y: low ? GROUND_Y - 30 : GROUND_Y - 90 + Math.sin(i * 0.7) * 12,
+          bob: i * 0.7,
           taken: false,
         });
       }
     };
 
-    // ── Input ─────────────────────────────────────────────────────────
-    let holdFrames = 0;
+    // Distance between obstacle spawns scales with speed for readability.
+    const obsGap = () => Math.max(260, 420 - speed * 16) + Math.random() * 120;
+    const tokGap = () => 340 + Math.random() * 220;
+
+    // ── Input ──────────────────────────────────────────────────────────
     let holding = false;
-    let lastAutoJumpAt = 0;
 
     const doJump = () => {
-      if (rocketActive) return; // rocket = auto-fly, no manual jump
-      if (p.onGround) {
-        p.vy = JUMP_FORCE;
-        p.onGround = false;
-        p.jumpsLeft = 0;
-        holdFrames = 0;
-        holding = true;
+      if (rocketLeftMs > 0) return; // rocket = auto-flight
+      if (player.onGround) {
+        player.vy = JUMP_VY;
+        player.onGround = false;
+        player.dj = djCharges > 0; // queue a double-jump if any charges
         playSound('jump');
-      } else if (djLeft > 0 && p.jumpsLeft === 0) {
-        p.vy = JUMP_FORCE * 0.88;
-        p.jumpsLeft = -1; // used double jump
-        djLeft--;
-        holdFrames = 0;
-        holding = true;
+      } else if (player.dj) {
+        player.vy = DJ_VY;
+        player.dj = false;
+        djCharges = Math.max(0, djCharges - 1);
         playSound('jump');
       }
     };
 
+    const resumeAudio = () => {
+      const ac = audioCtxRef.current;
+      if (ac && ac.state === 'suspended') ac.resume();
+    };
     const onPointerDown = (e: Event) => {
       e.preventDefault();
-      if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume();
+      resumeAudio();
+      holding = true;
       doJump();
     };
     const onPointerUp = () => { holding = false; };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); doJump(); holding = true; }
-      if (e.code === 'KeyP') onPause();
+      if (e.code === 'Space' || e.code === 'ArrowUp') {
+        e.preventDefault();
+        resumeAudio();
+        holding = true;
+        doJump();
+      } else if (e.code === 'KeyP') {
+        onPause();
+      }
     };
     const onKeyUp = (e: KeyboardEvent) => {
       if (e.code === 'Space' || e.code === 'ArrowUp') holding = false;
@@ -250,39 +290,31 @@ export default function Game2D({
 
     canvas.addEventListener('mousedown', onPointerDown);
     canvas.addEventListener('mouseup', onPointerUp);
+    canvas.addEventListener('mouseleave', onPointerUp);
     canvas.addEventListener('touchstart', onPointerDown, { passive: false });
     canvas.addEventListener('touchend', onPointerUp);
+    canvas.addEventListener('touchcancel', onPointerUp);
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
 
-    // ── Background stars (pre-computed, just scrolled) ─────────────────
-    const STAR_COUNT = 40;
+    // ── Background stars (static across frame; only position changes) ──
+    const STAR_COUNT = 28;
     const stars = Array.from({ length: STAR_COUNT }, () => ({
       x: Math.random() * W,
-      y: Math.random() * (GROUND - 30),
-      r: 0.5 + Math.random() * 1.2,
-      spd: 0.3 + Math.random() * 0.5,
+      y: Math.random() * (GROUND_Y - 20),
+      r: 0.6 + Math.random() * 1.1,
+      spd: 0.15 + Math.random() * 0.35,
     }));
 
-    // ── Throttled React state updates ──────────────────────────────────
-    let lastReactUpdate = 0;
-    const REACT_UPDATE_INTERVAL = 160; // ms
+    // ── Collision helper (AABB with safety margin) ─────────────────────
+    const M = 5; // inset
+    const hit = (o: Obstacle) =>
+      player.x + M < o.x + o.w &&
+      player.x + PW - M > o.x &&
+      player.y + M < o.y + o.h &&
+      player.y + PH - M > o.y;
 
-    // ── Ground line decoration ─────────────────────────────────────────
-    let groundOffset = 0;
-
-    // ── Trail ──────────────────────────────────────────────────────────
-    const trail: { x: number; y: number }[] = [];
-
-    // ── Collision helper ───────────────────────────────────────────────
-    const MARGIN = 6;
-    const hits = (o: Obs) =>
-      p.x + MARGIN < o.x + o.w &&
-      p.x + PLAYER_W - MARGIN > o.x &&
-      p.y + MARGIN < o.y + o.h &&
-      p.y + PLAYER_H - MARGIN > o.y;
-
-    // ── Draw helpers ───────────────────────────────────────────────────
+    // ── Rounded rect helper ────────────────────────────────────────────
     const rrect = (x: number, y: number, w: number, h: number, r: number) => {
       const cr = Math.min(r, w / 2, h / 2);
       ctx.beginPath();
@@ -298,233 +330,228 @@ export default function Game2D({
       ctx.closePath();
     };
 
-    // ── Main loop ─────────────────────────────────────────────────────
+    // ── Run-state scalars ──────────────────────────────────────────────
+    let distance = 0;        // total pixels traveled
+    let jumpEarned = 0;      // $JUMP tokens collected this run
+    let alive = true;
+    let lastReactUpdate = 0;
+    let groundOffset = 0;
+    let shakeMs = 0;
+
+    // ── Frame loop ─────────────────────────────────────────────────────
     let animId = 0;
     let lastTime = 0;
 
-    const loop = (now: number) => {
-      animId = requestAnimationFrame(loop);
+    const tick = (now: number) => {
+      animId = requestAnimationFrame(tick);
 
-      // Cap delta so a tab-switch doesn't cause a giant jump
-      const rawDt = now - lastTime;
+      const rawDt = lastTime === 0 ? 16 : now - lastTime;
       lastTime = now;
-      if (rawDt < 1) return; // first frame
+      // Normalize to 60fps baseline; clamp so background tabs / slow frames
+      // don't cause a giant step that teleports obstacles across the screen.
+      const dt = Math.min(rawDt, 48) / (1000 / 60);
 
-      // Clamp dt: treat anything > 50ms as 50ms (e.g. when tab is backgrounded)
-      const dt = Math.min(rawDt, 50) / (1000 / 60); // normalized to ~1 at 60fps
-
-      if (pausedRef.current) {
-        // Still draw the paused frame
-        drawFrame(now);
+      // Paused: keep rendering (for the "PAUSED" overlay) but skip physics.
+      if (pausedRef.current || !alive) {
+        render(now);
         return;
       }
 
-      // ── Update ──────────────────────────────────────────────────────
-
-      if (gameStartTime === 0) gameStartTime = now;
-
-      // Timed power-up queue
-      if (!timedQueueStarted && now - gameStartTime > TIMED_GRACE_MS) {
-        timedQueueStarted = true;
-        activateNextTimed(now);
+      // ── Rocket timer ────────────────────────────────────────────────
+      if (rocketLeftMs > 0) {
+        rocketLeftMs = Math.max(0, rocketLeftMs - rawDt);
+        if (rocketLeftMs === 0) {
+          // Drop back to the ground
+          player.onGround = false;
+        }
       }
-      if (magnetActive && now > magnetEnd) { magnetActive = false; activateNextTimed(now); }
-      if (slowmoActive && now > slowmoEnd) { slowmoActive = false; activateNextTimed(now); }
-      if (rocketActive && now > rocketEnd) { rocketActive = false; p.onGround = false; activateNextTimed(now); }
-
-      const effSpeed = rocketActive ? speed * 1.5 : slowmoActive ? speed * 0.5 : speed;
 
       // ── Player physics ──────────────────────────────────────────────
-      if (rocketActive) {
-        // Float at a fixed height
-        const targetY = GROUND - PLAYER_H - 100;
-        p.y += (targetY - p.y) * 0.15 * dt;
-        p.vy = 0;
-        p.onGround = false;
+      if (rocketLeftMs > 0) {
+        const targetY = GROUND_Y - PH - 90;
+        player.y += (targetY - player.y) * 0.18 * dt;
+        player.vy = 0;
+        player.onGround = false;
       } else {
-        // Hold-to-jump: add upward boost while holding and still rising
-        if (holding && holdFrames < MAX_HOLD_FRAMES && p.vy < 0) {
-          p.vy += HOLD_BONUS * dt;
-          holdFrames += dt;
-        }
-        p.vy = Math.min(p.vy + GRAVITY * dt, TERMINAL_VEL);
-        p.y += p.vy * dt;
+        const g = holding && player.vy < 0 ? GRAVITY_HOLD : GRAVITY;
+        player.vy = Math.min(player.vy + g * dt, MAX_FALL);
+        player.y += player.vy * dt;
 
-        // Ground snap
-        if (p.y >= GROUND - PLAYER_H) {
-          p.y = GROUND - PLAYER_H;
-          p.vy = 0;
-          p.onGround = true;
-          p.jumpsLeft = 1;
-          holdFrames = 0;
+        // Ground contact
+        if (player.y >= GROUND_Y - PH) {
+          player.y = GROUND_Y - PH;
+          player.vy = 0;
+          player.onGround = true;
+          player.dj = false;
         }
       }
 
-      // Trail
-      trail.push({ x: p.x + PLAYER_W / 2, y: p.y + PLAYER_H / 2 });
-      if (trail.length > 10) trail.shift();
-
-      // ── Auto-jump ───────────────────────────────────────────────────
-      if (autoLeft > 0 && p.onGround) {
-        const next = obstacles.find((o) => o.x + o.w > p.x);
-        if (next) {
-          const dist = next.x - (p.x + PLAYER_W);
-          if (dist > 60 && dist < 160 && now - lastAutoJumpAt > 600) {
-            doJump();
-            autoLeft--;
-            lastAutoJumpAt = now;
-          }
+      // ── Auto-jump assist ────────────────────────────────────────────
+      if (autoCharges > 0 && player.onGround && rocketLeftMs === 0) {
+        const ahead = obstacles.find((o) => o.kind === 'spike' && o.x > player.x && o.x - player.x < 150);
+        if (ahead) {
+          doJump();
+          autoCharges = Math.max(0, autoCharges - 1);
         }
       }
 
-      // ── Speed ramp ─────────────────────────────────────────────────
-      speed = Math.min(speed + SPEED_RAMP * dt, SPEED_MAX);
-      score += 0.08 * effSpeed * dt; // score tied to distance
+      // ── World scroll ────────────────────────────────────────────────
+      const mult = speedMultiplier();
+      const step = speed * mult * dt; // pixels moved this frame
+      distance += step;
+      groundOffset = (groundOffset + step) % 40;
 
-      // ── Obstacles ──────────────────────────────────────────────────
+      // Gentle ramp-up
+      speed = Math.min(SPEED_MAX, speed + SPEED_RAMP * dt);
+
+      // ── Spawns ──────────────────────────────────────────────────────
+      distSinceObstacle += step;
+      if (distSinceObstacle >= obsGap()) {
+        spawnObstacle();
+        distSinceObstacle = 0;
+      }
+      distSinceToken += step;
+      if (distSinceToken >= tokGap()) {
+        spawnTokens();
+        distSinceToken = 0;
+      }
+
+      // ── Obstacles ───────────────────────────────────────────────────
       for (const o of obstacles) {
-        o.x -= effSpeed * dt;
-        if (o.drone) o.phase += 0.08 * dt;
-        if (o.drone) o.y = (o.y - 0.5 * dt) + Math.sin(o.phase) * 0.8 * dt + 0.25 * dt;
-      }
-      obstacles = obstacles.filter((o) => o.x + o.w > -20);
-
-      distSinceObs += effSpeed * dt;
-      if (distSinceObs >= obsGap()) { spawnObs(); distSinceObs = 0; }
-
-      // ── Tokens ─────────────────────────────────────────────────────
-      for (const tk of tokens) {
-        tk.x -= effSpeed * dt;
-        tk.bob += 0.1 * dt;
-        if (magnetActive) {
-          const dx = (p.x + PLAYER_W / 2) - tk.x;
-          const dy = (p.y + PLAYER_H / 2) - tk.y;
-          const dist = Math.hypot(dx, dy);
-          if (dist < 220 && dist > 1) {
-            const pull = (1 - dist / 220) * 6 * dt;
-            tk.x += (dx / dist) * pull;
-            tk.y += (dy / dist) * pull;
-          }
+        o.x -= step;
+        if (o.kind === 'drone') {
+          o.phase += 0.06 * dt;
+          o.y = o.baseY + Math.sin(o.phase) * 14;
         }
       }
-      tokens = tokens.filter((tk) => !tk.taken && tk.x > -20);
+      obstacles = obstacles.filter((o) => o.x + o.w > -40);
 
-      distSinceTok += effSpeed * dt;
-      if (distSinceTok >= tokGap()) { spawnToks(); distSinceTok = 0; }
-
-      // ── Token collection ───────────────────────────────────────────
+      // ── Tokens (scroll, magnet, collect) ────────────────────────────
       for (const tk of tokens) {
-        const dx = tk.x - (p.x + PLAYER_W / 2);
-        const dy = tk.y - (p.y + PLAYER_H / 2);
-        if (Math.hypot(dx, dy) < 24) {
+        if (tk.taken) continue;
+        tk.x -= step;
+        tk.bob += 0.12 * dt;
+        if (magnetActive) {
+          const cx = player.x + PW / 2;
+          const cy = player.y + PH / 2;
+          const dx = cx - tk.x;
+          const dy = cy - tk.y;
+          const d = Math.hypot(dx, dy);
+          if (d < 220 && d > 0.01) {
+            const pull = (1 - d / 220) * 4 * dt;
+            tk.x += (dx / d) * pull;
+            tk.y += (dy / d) * pull;
+          }
+        }
+        // Collect?
+        const dx2 = tk.x - (player.x + PW / 2);
+        const dy2 = tk.y - (player.y + PH / 2);
+        if (Math.hypot(dx2, dy2) < 22) {
           tk.taken = true;
-          jumpTokens += 5;
+          jumpEarned += 5;
           playSound('coin');
         }
       }
+      tokens = tokens.filter((tk) => !tk.taken && tk.x > -30);
 
-      // ── Collision ──────────────────────────────────────────────────
+      // ── Collisions ──────────────────────────────────────────────────
       for (const o of obstacles) {
-        if (!hits(o)) continue;
-        if (rocketActive) {
-          // Rocket destroys obstacles
-          o.x = -9999;
-          playSound('hit');
+        if (!hit(o)) continue;
+        if (rocketLeftMs > 0) {
+          o.x = -9999; // destroyed
+          shakeMs = 140;
           continue;
         }
-        if (shieldLeft > 0) {
-          shieldLeft--;
+        if (shieldCharges > 0) {
+          shieldCharges--;
           o.x = -9999;
-          // Clear nearby obstacles too
-          obstacles.forEach((other) => { if (Math.abs(other.x - p.x) < 160) other.x = -9999; });
-          playSound('powerup');
+          shakeMs = 220;
+          // Also sweep nearby obstacles so the next frame doesn't insta-kill
+          obstacles.forEach((other) => {
+            if (other !== o && Math.abs(other.x - player.x) < 160) other.x = -9999;
+          });
+          playSound('power');
           continue;
         }
         // Dead
         alive = false;
+        shakeMs = 400;
         playSound('hit');
-        cbRef.current.onGameOver(Math.floor(score), jumpTokens);
+        cbRef.current.onGameOver(Math.floor(distance / 10), jumpEarned);
+        render(now);
         cancelAnimationFrame(animId);
-        drawFrame(now); // draw final death frame
         cleanup();
         return;
       }
 
-      // ── Background scroll ─────────────────────────────────────────
+      // ── Decay effects ───────────────────────────────────────────────
+      if (shakeMs > 0) shakeMs = Math.max(0, shakeMs - rawDt);
+
+      // ── Background parallax ────────────────────────────────────────
       for (const s of stars) {
         s.x -= s.spd * dt;
         if (s.x < -2) s.x = W + 2;
       }
-      groundOffset = (groundOffset + effSpeed * dt) % 40;
 
-      // ── Throttled React updates (score + jump bank) ────────────────
-      if (now - lastReactUpdate > REACT_UPDATE_INTERVAL) {
+      // ── Throttled React state updates (~6 per second) ──────────────
+      if (now - lastReactUpdate > 160) {
         lastReactUpdate = now;
-        cbRef.current.onScoreUpdate(Math.floor(score));
-        cbRef.current.onJumpCollected(jumpTokens);
+        cbRef.current.onScoreUpdate(Math.floor(distance / 10));
+        cbRef.current.onJumpCollected(jumpEarned);
       }
 
-      drawFrame(now);
+      render(now);
     };
 
-    // ── Draw ─────────────────────────────────────────────────────────
-    const drawFrame = (now: number) => {
-      ctx.clearRect(0, 0, W, H);
+    // ── Render ─────────────────────────────────────────────────────────
+    const render = (now: number) => {
+      // Camera shake
+      const shakeIntensity = shakeMs > 0 ? Math.min(6, shakeMs / 40) : 0;
+      const sx = shakeIntensity ? (Math.random() - 0.5) * shakeIntensity : 0;
+      const sy = shakeIntensity ? (Math.random() - 0.5) * shakeIntensity : 0;
+
+      ctx.save();
+      ctx.translate(sx, sy);
 
       // Sky gradient
-      const sky = ctx.createLinearGradient(0, 0, 0, GROUND);
-      sky.addColorStop(0, '#050b14');
-      sky.addColorStop(1, '#0a1628');
-      ctx.fillStyle = sky;
-      ctx.fillRect(0, 0, W, GROUND);
+      const g = ctx.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, '#050b14');
+      g.addColorStop(0.7, '#0a1628');
+      g.addColorStop(1, '#0d1f3c');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
 
       // Stars
       ctx.fillStyle = '#ffffff';
       for (const s of stars) {
-        ctx.globalAlpha = 0.6 + 0.4 * Math.sin(now * 0.001 + s.x);
+        ctx.globalAlpha = 0.35 + 0.35 * Math.sin(now * 0.002 + s.x * 0.05);
         ctx.beginPath();
         ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
         ctx.fill();
       }
       ctx.globalAlpha = 1;
 
-      // Ground
-      ctx.fillStyle = '#0d1f3c';
-      ctx.fillRect(0, GROUND, W, H - GROUND);
       // Ground glow line
       ctx.strokeStyle = '#06b6d4';
       ctx.lineWidth = 2;
       ctx.shadowColor = '#06b6d4';
-      ctx.shadowBlur = 10;
+      ctx.shadowBlur = 14;
       ctx.beginPath();
-      ctx.moveTo(0, GROUND);
-      ctx.lineTo(W, GROUND);
+      ctx.moveTo(0, GROUND_Y);
+      ctx.lineTo(W, GROUND_Y);
       ctx.stroke();
       ctx.shadowBlur = 0;
 
-      // Ground dashes
+      // Dashed sub-line for motion feel
       ctx.strokeStyle = 'rgba(6,182,212,0.25)';
       ctx.lineWidth = 1;
-      ctx.setLineDash([20, 20]);
+      ctx.setLineDash([18, 18]);
       ctx.lineDashOffset = -groundOffset;
       ctx.beginPath();
-      ctx.moveTo(0, GROUND + 14);
-      ctx.lineTo(W, GROUND + 14);
+      ctx.moveTo(0, GROUND_Y + 14);
+      ctx.lineTo(W, GROUND_Y + 14);
       ctx.stroke();
       ctx.setLineDash([]);
-      ctx.lineDashOffset = 0;
-
-      // Trail
-      for (let i = 0; i < trail.length; i++) {
-        const t = trail[i];
-        const a = (i / trail.length) * 0.5;
-        ctx.globalAlpha = a;
-        ctx.fillStyle = rocketActive ? '#f59e0b' : '#06b6d4';
-        ctx.beginPath();
-        ctx.arc(t.x, t.y, 3 + (i / trail.length) * 4, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
 
       // Tokens
       for (const tk of tokens) {
@@ -533,33 +560,29 @@ export default function Game2D({
         ctx.save();
         ctx.shadowColor = '#f59e0b';
         ctx.shadowBlur = 12;
-        // Coin circle
         ctx.fillStyle = '#f59e0b';
         ctx.beginPath();
         ctx.arc(tk.x, ty, 10, 0, Math.PI * 2);
         ctx.fill();
-        // Inner circle
         ctx.fillStyle = '#fbbf24';
         ctx.beginPath();
         ctx.arc(tk.x, ty, 7, 0, Math.PI * 2);
         ctx.fill();
-        // "J" label
         ctx.fillStyle = '#78350f';
         ctx.font = 'bold 9px ui-sans-serif, system-ui';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText('J', tk.x, ty);
+        ctx.fillText('J', tk.x, ty + 1);
         ctx.restore();
       }
 
       // Obstacles
       for (const o of obstacles) {
-        if (o.x < -20 || o.x > W + 20) continue;
+        if (o.x < -40 || o.x > W + 40) continue;
         ctx.save();
-        if (o.drone) {
-          // Drone: glowing magenta box
+        if (o.kind === 'drone') {
           ctx.shadowColor = '#e879a0';
-          ctx.shadowBlur = 14;
+          ctx.shadowBlur = 12;
           ctx.fillStyle = '#831843';
           rrect(o.x, o.y, o.w, o.h, 5);
           ctx.fill();
@@ -567,7 +590,7 @@ export default function Game2D({
           ctx.lineWidth = 1.5;
           rrect(o.x, o.y, o.w, o.h, 5);
           ctx.stroke();
-          // Propeller lines
+          // Propellers
           ctx.strokeStyle = '#f472b6';
           ctx.lineWidth = 2;
           ctx.beginPath();
@@ -575,9 +598,8 @@ export default function Game2D({
           ctx.moveTo(o.x + o.w - 8, o.y - 4); ctx.lineTo(o.x + o.w - 8, o.y);
           ctx.stroke();
         } else {
-          // Ground obstacle
           ctx.shadowColor = '#ef4444';
-          ctx.shadowBlur = 14;
+          ctx.shadowBlur = 12;
           ctx.fillStyle = '#7f1d1d';
           rrect(o.x, o.y, o.w, o.h, 4);
           ctx.fill();
@@ -585,74 +607,78 @@ export default function Game2D({
           ctx.lineWidth = 1.5;
           rrect(o.x, o.y, o.w, o.h, 4);
           ctx.stroke();
-          // spike top
+          // Spikes along top
           ctx.fillStyle = '#ef4444';
-          ctx.beginPath();
-          ctx.moveTo(o.x + o.w / 2 - 5, o.y);
-          ctx.lineTo(o.x + o.w / 2, o.y - 10);
-          ctx.lineTo(o.x + o.w / 2 + 5, o.y);
-          ctx.closePath();
-          ctx.fill();
+          const spikes = Math.max(2, Math.floor(o.w / 8));
+          const sw = o.w / spikes;
+          for (let i = 0; i < spikes; i++) {
+            const xi = o.x + i * sw;
+            ctx.beginPath();
+            ctx.moveTo(xi, o.y);
+            ctx.lineTo(xi + sw / 2, o.y - 8);
+            ctx.lineTo(xi + sw, o.y);
+            ctx.closePath();
+            ctx.fill();
+          }
         }
         ctx.restore();
       }
 
       // Player
       ctx.save();
-      const px = p.x;
-      const py = p.y;
-      const pw = PLAYER_W;
-      const ph = PLAYER_H;
+      const px = player.x;
+      const py = player.y;
 
       // Shield aura
-      if (shieldLeft > 0) {
+      if (shieldCharges > 0) {
         ctx.strokeStyle = '#06b6d4';
         ctx.lineWidth = 2.5;
         ctx.shadowColor = '#06b6d4';
         ctx.shadowBlur = 20;
         ctx.beginPath();
-        ctx.arc(px + pw / 2, py + ph / 2, pw / 2 + 10, 0, Math.PI * 2);
+        ctx.arc(px + PW / 2, py + PH / 2, PW / 2 + 10, 0, Math.PI * 2);
         ctx.stroke();
         ctx.shadowBlur = 0;
       }
 
       // Body glow
-      ctx.shadowColor = rocketActive ? '#f59e0b' : magnetActive ? '#e879a0' : '#06b6d4';
-      ctx.shadowBlur = rocketActive ? 30 : 18;
-
-      // Body
-      ctx.fillStyle = rocketActive ? '#f59e0b' : '#0ea5e9';
-      rrect(px + 4, py, pw - 8, ph, 8);
+      ctx.shadowColor = rocketLeftMs > 0 ? '#f59e0b' : '#06b6d4';
+      ctx.shadowBlur = rocketLeftMs > 0 ? 28 : 16;
+      ctx.fillStyle = rocketLeftMs > 0 ? '#f59e0b' : '#0ea5e9';
+      rrect(px + 4, py, PW - 8, PH, 8);
       ctx.fill();
 
-      // Head
-      ctx.fillStyle = rocketActive ? '#fbbf24' : '#38bdf8';
-      rrect(px + 7, py + 4, pw - 14, ph * 0.45, 6);
+      // Head tint
+      ctx.fillStyle = rocketLeftMs > 0 ? '#fbbf24' : '#38bdf8';
+      rrect(px + 7, py + 4, PW - 14, PH * 0.45, 6);
       ctx.fill();
 
       // Eye
       ctx.fillStyle = '#0f172a';
       ctx.beginPath();
-      ctx.arc(px + pw / 2 + 5, py + 14, 4, 0, Math.PI * 2);
+      ctx.arc(px + PW / 2 + 4, py + 14, 3.5, 0, Math.PI * 2);
       ctx.fill();
       ctx.fillStyle = '#ffffff';
       ctx.beginPath();
-      ctx.arc(px + pw / 2 + 6, py + 13, 1.5, 0, Math.PI * 2);
+      ctx.arc(px + PW / 2 + 5, py + 13, 1.3, 0, Math.PI * 2);
       ctx.fill();
 
-      // Legs
-      ctx.fillStyle = rocketActive ? '#d97706' : '#0284c7';
-      rrect(px + 6, py + ph - 14, 10, 14, 3); ctx.fill();
-      rrect(px + pw - 16, py + ph - 14, 10, 14, 3); ctx.fill();
+      // Legs (hidden while jumping/flying)
+      if (player.onGround && rocketLeftMs === 0) {
+        const wobble = Math.sin(now * 0.025) * 2;
+        ctx.fillStyle = '#0284c7';
+        rrect(px + 6, py + PH - 12 + wobble, 9, 12, 3); ctx.fill();
+        rrect(px + PW - 15, py + PH - 12 - wobble, 9, 12, 3); ctx.fill();
+      }
 
       // Rocket flame
-      if (rocketActive) {
+      if (rocketLeftMs > 0) {
         ctx.fillStyle = '#fde68a';
         ctx.globalAlpha = 0.8 + 0.2 * Math.sin(now * 0.02);
         ctx.beginPath();
-        ctx.moveTo(px + 8, py + ph);
-        ctx.lineTo(px + pw / 2, py + ph + 18 + Math.random() * 6);
-        ctx.lineTo(px + pw - 8, py + ph);
+        ctx.moveTo(px + 8, py + PH);
+        ctx.lineTo(px + PW / 2, py + PH + 16 + Math.random() * 5);
+        ctx.lineTo(px + PW - 8, py + PH);
         ctx.closePath();
         ctx.fill();
         ctx.globalAlpha = 1;
@@ -660,63 +686,58 @@ export default function Game2D({
       ctx.shadowBlur = 0;
       ctx.restore();
 
-      // HUD: active power-up badge
-      const activeName = rocketActive ? 'ROCKET' : slowmoActive ? 'SLOW-MO' : magnetActive ? 'MAGNET' : null;
-      const activeEnd = rocketActive ? rocketEnd : slowmoActive ? slowmoEnd : magnetActive ? magnetEnd : 0;
-
-      if (activeName && activeEnd > 0) {
-        const remaining = Math.max(0, activeEnd - now);
-        const dur = rocketActive ? TIMED_DUR.rocket : slowmoActive ? TIMED_DUR.slowmo : TIMED_DUR.magnet;
-        const frac = remaining / dur;
-        const bx = W / 2 - 60;
-        const by = 12;
-        const bw = 120;
-        const bh = 22;
-        ctx.fillStyle = 'rgba(5,15,30,0.85)';
-        rrect(bx, by, bw, bh, 6);
-        ctx.fill();
-        // Progress bar fill
-        ctx.fillStyle = rocketActive ? '#f59e0b' : slowmoActive ? '#06b6d4' : '#e879a0';
-        rrect(bx + 2, by + 2, (bw - 4) * frac, bh - 4, 4);
-        ctx.fill();
-        // Label
-        ctx.fillStyle = '#ffffff';
-        ctx.font = 'bold 10px ui-sans-serif, system-ui';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(activeName, bx + bw / 2, by + bh / 2);
-      }
-
-      // HUD: score top-right
-      ctx.fillStyle = 'rgba(5,15,30,0.75)';
-      rrect(W - 110, 10, 100, 28, 6);
+      // HUD — score top-right
+      const score = Math.floor(distance / 10);
+      ctx.fillStyle = 'rgba(5,15,30,0.78)';
+      rrect(W - 116, 10, 104, 32, 6);
       ctx.fill();
       ctx.fillStyle = '#94a3b8';
       ctx.font = 'bold 9px ui-sans-serif, system-ui';
       ctx.textAlign = 'left';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('SCORE', W - 105, 20);
+      ctx.textBaseline = 'top';
+      ctx.fillText('SCORE', W - 110, 14);
       ctx.fillStyle = '#f8fafc';
-      ctx.font = 'bold 13px ui-sans-serif, system-ui';
-      ctx.fillText(Math.floor(score).toString(), W - 105, 31);
+      ctx.font = 'bold 15px ui-sans-serif, system-ui';
+      ctx.fillText(score.toString(), W - 110, 24);
 
-      // HUD: shield indicator
-      if (shieldLeft > 0) {
-        ctx.fillStyle = 'rgba(6,182,212,0.15)';
-        rrect(W - 110, 44, 100, 22, 6);
+      // HUD — earned $JUMP top-right (below score)
+      ctx.fillStyle = 'rgba(245,158,11,0.12)';
+      rrect(W - 116, 48, 104, 24, 6);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(245,158,11,0.5)';
+      ctx.lineWidth = 1;
+      rrect(W - 116, 48, 104, 24, 6);
+      ctx.stroke();
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = 'bold 10px ui-sans-serif, system-ui';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`+${jumpEarned} $JUMP`, W - 110, 60);
+
+      // HUD — active power-up chips (left)
+      let chipY = 12;
+      const addChip = (label: string, color: string) => {
+        ctx.fillStyle = 'rgba(5,15,30,0.80)';
+        rrect(12, chipY, 96, 20, 5);
         ctx.fill();
-        ctx.strokeStyle = 'rgba(6,182,212,0.6)';
+        ctx.strokeStyle = color;
         ctx.lineWidth = 1;
-        rrect(W - 110, 44, 100, 22, 6);
+        rrect(12, chipY, 96, 20, 5);
         ctx.stroke();
-        ctx.fillStyle = '#06b6d4';
-        ctx.font = 'bold 9px ui-sans-serif, system-ui';
+        ctx.fillStyle = color;
+        ctx.font = 'bold 10px ui-sans-serif, system-ui';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        ctx.fillText(`SHIELD ×${shieldLeft}`, W - 104, 55);
-      }
+        ctx.fillText(label, 20, chipY + 10);
+        chipY += 24;
+      };
+      if (rocketLeftMs > 0) addChip(`ROCKET ${(rocketLeftMs / 1000).toFixed(1)}s`, '#f59e0b');
+      if (shieldCharges > 0) addChip(`SHIELD x${shieldCharges}`, '#06b6d4');
+      if (djCharges > 0) addChip(`DBL JUMP x${djCharges}`, '#34d399');
+      if (autoCharges > 0) addChip(`AUTO x${autoCharges}`, '#a3e635');
+      if (magnetActive) addChip('MAGNET', '#e879a0');
+      if (slowmoActive) addChip('SLOW-MO', '#38bdf8');
 
-      // Pause overlay
+      // Paused overlay
       if (pausedRef.current) {
         ctx.fillStyle = 'rgba(5,10,20,0.70)';
         ctx.fillRect(0, 0, W, H);
@@ -724,13 +745,13 @@ export default function Game2D({
         ctx.font = 'bold 28px ui-sans-serif, system-ui';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText('PAUSED', W / 2, H / 2);
+        ctx.fillText('PAUSED', W / 2, H / 2 - 8);
         ctx.fillStyle = '#94a3b8';
-        ctx.font = '13px ui-sans-serif, system-ui';
-        ctx.fillText('Buy power-ups below, then resume', W / 2, H / 2 + 28);
+        ctx.font = '12px ui-sans-serif, system-ui';
+        ctx.fillText('Tap play or press P to resume', W / 2, H / 2 + 18);
       }
 
-      // Death overlay
+      // Death overlay (shown briefly before React shows GameOver screen)
       if (!alive) {
         ctx.fillStyle = 'rgba(5,10,20,0.75)';
         ctx.fillRect(0, 0, W, H);
@@ -738,23 +759,27 @@ export default function Game2D({
         ctx.font = 'bold 30px ui-sans-serif, system-ui';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText('GAME OVER', W / 2, H / 2 - 14);
-        ctx.fillStyle = '#94a3b8';
+        ctx.fillText('GAME OVER', W / 2, H / 2 - 10);
+        ctx.fillStyle = '#cbd5e1';
         ctx.font = '14px ui-sans-serif, system-ui';
-        ctx.fillText(`Score: ${Math.floor(score)}`, W / 2, H / 2 + 18);
+        ctx.fillText(`Score ${Math.floor(distance / 10)}`, W / 2, H / 2 + 18);
       }
+
+      ctx.restore();
     };
 
     const cleanup = () => {
       canvas.removeEventListener('mousedown', onPointerDown);
       canvas.removeEventListener('mouseup', onPointerUp);
+      canvas.removeEventListener('mouseleave', onPointerUp);
       canvas.removeEventListener('touchstart', onPointerDown);
       canvas.removeEventListener('touchend', onPointerUp);
+      canvas.removeEventListener('touchcancel', onPointerUp);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
     };
 
-    animId = requestAnimationFrame(loop);
+    animId = requestAnimationFrame(tick);
     return () => {
       cancelAnimationFrame(animId);
       cleanup();
@@ -772,8 +797,7 @@ export default function Game2D({
         aria-label="Jumparun game canvas — tap to jump"
         role="img"
       />
-      {/* In-game controls overlay */}
-      <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-white/40">
+      <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-white/35">
         <span>Tap</span>
         <span className="opacity-50">/</span>
         <span>Space to jump</span>
@@ -784,7 +808,11 @@ export default function Game2D({
           className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-black/50 text-white/70 backdrop-blur transition hover:border-white/30 hover:text-white"
           aria-label={paused ? 'Resume game' : 'Pause game'}
         >
-          {paused ? <Play className="h-3.5 w-3.5" fill="currentColor" /> : <Pause className="h-3.5 w-3.5" />}
+          {paused ? (
+            <Play className="h-3.5 w-3.5" fill="currentColor" />
+          ) : (
+            <Pause className="h-3.5 w-3.5" />
+          )}
         </button>
         <button
           onClick={onHome}

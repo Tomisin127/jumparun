@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Shield, Zap, Magnet, Rocket, Hourglass, PlayCircle, Loader2, CheckCircle2 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { POWERUPS, type PowerUpId, type PowerUpInventory } from '@/lib/powerups';
@@ -61,13 +61,16 @@ export default function PowerUpShop({ inventory, onGrantPowerUp }: PowerUpShopPr
     hash: pendingHash,
   });
 
-  // Once the tx is confirmed, grant the power-up
-  const handleConfirmed = (id: PowerUpId) => {
-    onGrantPowerUp(id);
-    setPendingId(null);
-    setPendingHash(undefined);
-    toast.success(`${POWERUPS[id].short} activated!`);
-  };
+  // Once the tx is confirmed, grant the power-up (effect — NOT render-phase).
+  useEffect(() => {
+    if (isConfirmed && pendingId && pendingHash) {
+      const id = pendingId;
+      onGrantPowerUp(id);
+      setPendingId(null);
+      setPendingHash(undefined);
+      toast.success(`${POWERUPS[id].short} unlocked!`);
+    }
+  }, [isConfirmed, pendingId, pendingHash, onGrantPowerUp]);
 
   const buy = async (id: PowerUpId) => {
     if (!address) { toast.error('Connect your wallet first'); return; }
@@ -94,11 +97,6 @@ export default function PowerUpShop({ inventory, onGrantPowerUp }: PowerUpShopPr
       toast.error(msg.slice(0, 80));
     }
   };
-
-  // When wagmi confirms, fire grant
-  if (isConfirmed && pendingId && pendingHash) {
-    handleConfirmed(pendingId);
-  }
 
   const ids: PowerUpId[] = ['shield', 'doubleJump', 'magnet', 'slowmo', 'autoJump', 'rocket'];
 
