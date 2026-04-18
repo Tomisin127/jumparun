@@ -8,8 +8,6 @@ export interface Game2DProps {
   isPlaying: boolean;
   paused: boolean;
   inventory: PowerUpInventory;
-  /** Order in which timed/charge power-ups should activate. */
-  queue: PowerUpId[];
   onGameOver: (score: number, jumpEarned: number) => void;
   onScoreUpdate: (score: number) => void;
   onJumpCollected: (total: number) => void;
@@ -18,59 +16,10 @@ export interface Game2DProps {
   onHome: () => void;
 }
 
-interface Vec {
-  x: number;
-  y: number;
-}
-
-interface Player extends Vec {
-  w: number;
-  h: number;
-  vy: number;
-  onGround: boolean;
-  jumpsUsed: number;
-  trail: Vec[];
-}
-
-type ObstacleType = 'spike' | 'tall' | 'drone' | 'saw';
-interface Obstacle extends Vec {
-  w: number;
-  h: number;
-  type: ObstacleType;
-  phase: number;
-}
-
-interface Token extends Vec {
-  collected: boolean;
-  bob: number;
-}
-
-interface Particle extends Vec {
-  vx: number;
-  vy: number;
-  life: number;
-  size: number;
-  color: string;
-}
-
-interface Star extends Vec {
-  size: number;
-  speed: number;
-  twinkle: number;
-}
-
-interface Mountain {
-  x: number;
-  w: number;
-  h: number;
-  shade: number;
-}
-
 export default function Game2D({
   isPlaying,
   paused,
   inventory,
-  queue,
   onGameOver,
   onScoreUpdate,
   onJumpCollected,
@@ -79,1061 +28,770 @@ export default function Game2D({
   onHome,
 }: Game2DProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 480 });
-  const audioCtxRef = useRef<AudioContext | null>(null);
+  const [dimensions, setDimensions] = useState({ width: 800, height: 360 });
 
-  const cbRef = useRef({
-    onGameOver,
-    onScoreUpdate,
-    onJumpCollected,
-    onConsumePowerUp,
-  });
+  // Keep latest callbacks/state in refs so the game loop closure never goes stale
+  const cbRef = useRef({ onGameOver, onScoreUpdate, onJumpCollected, onConsumePowerUp });
   const pausedRef = useRef(paused);
   const inventoryRef = useRef(inventory);
-  const queueRef = useRef(queue);
 
   useEffect(() => {
     cbRef.current = { onGameOver, onScoreUpdate, onJumpCollected, onConsumePowerUp };
-  }, [onGameOver, onScoreUpdate, onJumpCollected, onConsumePowerUp]);
+  });
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
+  useEffect(() => { inventoryRef.current = inventory; }, [inventory]);
 
   useEffect(() => {
-    pausedRef.current = paused;
-  }, [paused]);
-
-  useEffect(() => {
-    inventoryRef.current = inventory;
-  }, [inventory]);
-
-  useEffect(() => {
-    queueRef.current = queue;
-  }, [queue]);
-
-  useEffect(() => {
-    const update = () => {
-      const maxW = Math.min(window.innerWidth - 16, 960);
-      const h = Math.min(window.innerHeight * 0.6, 500);
-      setDimensions({ width: maxW, height: h });
+    const resize = () => {
+      const w = Math.min(window.innerWidth - 16, 900);
+      const h = Math.round(w * 0.42);
+      setDimensions({ width: w, height: Math.max(h, 260) });
     };
-    update();
-    window.addEventListener('resize', update);
-    return () => window.removeEventListener('resize', update);
+    resize();
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
   }, []);
 
+  // Stable sound helper (doesn't depend on game state)
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const playSound = useCallback((type: 'jump' | 'coin' | 'hit' | 'powerup') => {
     try {
-      const ctx = audioCtxRef.current;
-      if (!ctx) return;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
+      if (!audioCtxRef.current) return;
+      const ac = audioCtxRef.current;
+      const osc = ac.createOscillator();
+      const g = ac.createGain();
+      osc.connect(g); g.connect(ac.destination);
+      const t = ac.currentTime;
       if (type === 'jump') {
-        osc.frequency.setValueAtTime(420, ctx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(780, ctx.currentTime + 0.1);
-        gain.gain.setValueAtTime(0.12, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.1);
+        osc.frequency.setValueAtTime(400, t);
+        osc.frequency.exponentialRampToValueAtTime(800, t + 0.12);
+        g.gain.setValueAtTime(0.1, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+        osc.start(t); osc.stop(t + 0.12);
       } else if (type === 'coin') {
         osc.type = 'square';
-        osc.frequency.setValueAtTime(900, ctx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(1320, ctx.currentTime + 0.08);
-        gain.gain.setValueAtTime(0.08, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.08);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.1);
+        osc.frequency.setValueAtTime(880, t);
+        osc.frequency.exponentialRampToValueAtTime(1320, t + 0.09);
+        g.gain.setValueAtTime(0.06, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+        osc.start(t); osc.stop(t + 0.1);
       } else if (type === 'hit') {
         osc.type = 'sawtooth';
-        osc.frequency.setValueAtTime(260, ctx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(60, ctx.currentTime + 0.4);
-        gain.gain.setValueAtTime(0.18, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.4);
+        osc.frequency.setValueAtTime(240, t);
+        osc.frequency.exponentialRampToValueAtTime(55, t + 0.35);
+        g.gain.setValueAtTime(0.15, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+        osc.start(t); osc.stop(t + 0.35);
       } else {
         osc.type = 'triangle';
-        osc.frequency.setValueAtTime(520, ctx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(1040, ctx.currentTime + 0.2);
-        gain.gain.setValueAtTime(0.12, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.2);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.22);
+        osc.frequency.setValueAtTime(500, t);
+        osc.frequency.exponentialRampToValueAtTime(1000, t + 0.18);
+        g.gain.setValueAtTime(0.1, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+        osc.start(t); osc.stop(t + 0.2);
       }
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
   }, []);
 
+  // Main game loop — restarts every time isPlaying flips on or dimensions change
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !isPlaying) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    // Init audio on first user interaction (canvas click/touch starts it)
     if (!audioCtxRef.current) {
       try {
-        audioCtxRef.current = new (window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-      } catch {
-        /* ignore */
-      }
+        audioCtxRef.current = new (
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+        )();
+      } catch { /* ignore */ }
     }
 
     const W = dimensions.width;
     const H = dimensions.height;
-    const GROUND_Y = H - 70;
+    const GROUND = H - 60;       // y where ground surface is
+    const PLAYER_W = 38;
+    const PLAYER_H = 44;
 
-    // Physics
-    const GRAVITY = 0.8;
-    const JUMP_V = -14.5;
-    const DOUBLE_JUMP_V = -12.5;
-    const MAX_HOLD = 9;
+    // ── Physics constants ─────────────────────────────────────────────
+    const GRAVITY = 0.55;
+    const JUMP_FORCE = -13;
+    const HOLD_BONUS = -0.4;     // extra vy each frame while holding, up to MAX_HOLD frames
+    const MAX_HOLD_FRAMES = 10;
+    const TERMINAL_VEL = 18;
 
-    const player: Player = {
-      x: 110,
-      y: GROUND_Y - 52,
-      w: 44,
-      h: 52,
-      vy: 0,
-      onGround: true,
-      jumpsUsed: 0,
-      trail: [],
-    };
-
-    let obstacles: Obstacle[] = [];
-    let tokens: Token[] = [];
-    let particles: Particle[] = [];
-    const stars: Star[] = [];
-    const mountains: Mountain[] = [];
-
-    for (let i = 0; i < 55; i++) {
-      stars.push({
-        x: Math.random() * W,
-        y: Math.random() * (GROUND_Y - 40),
-        size: Math.random() * 1.5 + 0.3,
-        speed: 0.08 + Math.random() * 0.18,
-        twinkle: Math.random() * Math.PI * 2,
-      });
-    }
-    for (let i = 0; i < 10; i++) {
-      mountains.push({
-        x: (W / 5) * i + Math.random() * 60,
-        w: 160 + Math.random() * 120,
-        h: 80 + Math.random() * 120,
-        shade: Math.random() * 0.3,
-      });
-    }
-
-    // -------- Runtime state --------
+    // ── Game state (plain variables — no React setState inside loop) ──
+    let alive = true;
     let score = 0;
-    let jumpCount = 0;
-    let speed = 4.6;
-    let gameActive = true;
-    let cameraShake = 0;
-    let jumpHold = 0;
-    let isHoldingJump = false;
+    let jumpTokens = 0;          // earned this run
+    let speed = 4.2;             // pixels/frame at 60fps equivalent
+    const SPEED_MAX = 9;
+    const SPEED_RAMP = 0.0008;   // added each frame
 
-    // Passive power-ups (always available from start if purchased)
-    let shieldCharges = inventoryRef.current.shield;
-    let djRemaining = inventoryRef.current.doubleJump;
-    let autoJumpRemaining = inventoryRef.current.autoJump;
+    // ── Player ────────────────────────────────────────────────────────
+    const p = { x: 90, y: GROUND - PLAYER_H, vy: 0, onGround: true, jumpsLeft: 1 };
 
-    // Timed power-up queue (one at a time)
+    // ── Power-up state (read from inventory at game start, then local) ─
+    let shieldLeft = inventoryRef.current.shield;
+    let djLeft = inventoryRef.current.doubleJump;       // extra mid-air jumps
+    let autoLeft = inventoryRef.current.autoJump;
+    let magnetActive = false;
+    let magnetEnd = 0;
+    let slowmoActive = false;
+    let slowmoEnd = 0;
+    let rocketActive = false;
+    let rocketEnd = 0;
+
+    // Consume passive power-ups from inventory immediately
+    for (let i = 0; i < inventoryRef.current.shield; i++) cbRef.current.onConsumePowerUp('shield');
+    for (let i = 0; i < inventoryRef.current.doubleJump; i++) cbRef.current.onConsumePowerUp('doubleJump');
+    for (let i = 0; i < inventoryRef.current.autoJump; i++) cbRef.current.onConsumePowerUp('autoJump');
+
+    // Timed power-ups: activate them sequentially
+    // Build a queue from inventory at game start
     type TimedId = 'magnet' | 'slowmo' | 'rocket';
-    const timedQueue: TimedId[] = [];
-    const qInv = { ...inventoryRef.current };
-    // Use the provided purchase order so things activate in the order the user bought them
-    queueRef.current.forEach((id) => {
-      if (id === 'magnet' || id === 'slowmo' || id === 'rocket') {
-        while (qInv[id] > 0) {
-          timedQueue.push(id);
-          qInv[id]--;
-        }
-      }
-    });
-    // Any leftovers (shouldn't happen) append
+    const TIMED_DUR: Record<TimedId, number> = { magnet: 12000, slowmo: 8000, rocket: 5000 };
+    const timedQ: TimedId[] = [];
     (['magnet', 'slowmo', 'rocket'] as TimedId[]).forEach((id) => {
-      while (qInv[id] > 0) {
-        timedQueue.push(id);
-        qInv[id]--;
-      }
+      for (let i = 0; i < inventoryRef.current[id]; i++) timedQ.push(id);
+      for (let i = 0; i < inventoryRef.current[id]; i++) cbRef.current.onConsumePowerUp(id);
     });
+    let timedQueueStarted = false;
+    const TIMED_GRACE_MS = 2000; // wait before first activation
+    let gameStartTime = 0;
 
-    // Currently active timed power-up
-    let activeTimed: TimedId | null = null;
-    let activeTimedEnd = 0;
-    let activeTimedStart = 0;
-
-    const TIMED_DURATIONS: Record<TimedId, number> = {
-      magnet: 12_000,
-      slowmo: 8_000,
-      rocket: 5_000,
-    };
-
-    const startNextTimed = (now: number) => {
-      const next = timedQueue.shift();
-      if (!next) {
-        activeTimed = null;
-        return;
-      }
-      activeTimed = next;
-      activeTimedStart = now;
-      activeTimedEnd = now + TIMED_DURATIONS[next];
-      cbRef.current.onConsumePowerUp(next);
+    const activateNextTimed = (now: number) => {
+      const next = timedQ.shift();
+      if (!next) return;
+      const end = now + TIMED_DUR[next];
+      if (next === 'magnet') { magnetActive = true; magnetEnd = end; }
+      else if (next === 'slowmo') { slowmoActive = true; slowmoEnd = end; }
+      else if (next === 'rocket') { rocketActive = true; rocketEnd = end; }
       playSound('powerup');
     };
 
-    // Consume passive power-ups so the inventory stays in sync
-    if (shieldCharges > 0) {
-      for (let i = 0; i < shieldCharges; i++) cbRef.current.onConsumePowerUp('shield');
-    }
-    // doubleJump and autoJump are charge-based but we consume all at game start
-    if (djRemaining > 0) {
-      for (let i = 0; i < djRemaining; i++) cbRef.current.onConsumePowerUp('doubleJump');
-    }
-    if (autoJumpRemaining > 0) {
-      for (let i = 0; i < autoJumpRemaining; i++) cbRef.current.onConsumePowerUp('autoJump');
-    }
+    // ── Obstacles ─────────────────────────────────────────────────────
+    interface Obs { x: number; y: number; w: number; h: number; phase: number; drone: boolean }
+    let obstacles: Obs[] = [];
+    let distSinceObs = 0;
+    // Minimum gap scales with speed so game stays readable
+    const obsGap = () => Math.max(260, 420 - speed * 12) + Math.random() * 120;
 
-    // Start first timed power-up after a short grace period so the player has time to orient
-    const firstTimedAt = performance.now() + 1500;
-    let firstTimedStarted = false;
+    const spawnObs = () => {
+      const drone = Math.random() < 0.2;
+      if (drone) {
+        obstacles.push({
+          x: W + 30, w: 48, h: 26,
+          y: GROUND - 100 - Math.random() * 40,
+          phase: 0, drone: true,
+        });
+      } else {
+        const tall = Math.random() < 0.3;
+        const h = tall ? 66 : 38;
+        obstacles.push({ x: W + 30, w: 26, h, y: GROUND - h, phase: 0, drone: false });
+      }
+    };
 
-    // Throttle React state updates (biggest perf fix — was firing every frame!)
-    let lastScoreSent = 0;
-    let lastTokenSent = 0;
-    const STATE_UPDATE_MS = 150;
+    // ── Tokens ($JUMP) ─────────────────────────────────────────────────
+    interface Tok { x: number; y: number; bob: number; taken: boolean }
+    let tokens: Tok[] = [];
+    let distSinceTok = 0;
+    const tokGap = () => 460 + Math.random() * 280;
 
-    let lastAutoJump = 0;
-
-    const spawnParticles = (x: number, y: number, color: string, count = 10, spread = 6) => {
-      for (let i = 0; i < count; i++) {
-        particles.push({
-          x,
-          y,
-          vx: (Math.random() - 0.5) * spread,
-          vy: (Math.random() - 0.8) * spread,
-          life: 1,
-          size: 2 + Math.random() * 3,
-          color,
+    const spawnToks = () => {
+      const baseX = W + 50;
+      const low = Math.random() < 0.5;
+      for (let i = 0; i < 4; i++) {
+        tokens.push({
+          x: baseX + i * 38,
+          y: low ? GROUND - 34 : GROUND - 95 - Math.sin((i / 3) * Math.PI) * 30,
+          bob: i * 0.5,
+          taken: false,
         });
       }
     };
 
+    // ── Input ─────────────────────────────────────────────────────────
+    let holdFrames = 0;
+    let holding = false;
+    let lastAutoJumpAt = 0;
+
     const doJump = () => {
-      const rocketOn = activeTimed === 'rocket';
-      if (rocketOn) return;
-      if (player.onGround) {
-        player.vy = JUMP_V;
-        player.onGround = false;
-        player.jumpsUsed = 1;
-        jumpHold = 0;
-        isHoldingJump = true;
+      if (rocketActive) return; // rocket = auto-fly, no manual jump
+      if (p.onGround) {
+        p.vy = JUMP_FORCE;
+        p.onGround = false;
+        p.jumpsLeft = 0;
+        holdFrames = 0;
+        holding = true;
         playSound('jump');
-        spawnParticles(player.x + player.w / 2, player.y + player.h, 'hsl(190 95% 50%)', 8, 5);
-      } else if (djRemaining > 0 && player.jumpsUsed < 2) {
-        player.vy = DOUBLE_JUMP_V;
-        player.jumpsUsed = 2;
-        jumpHold = 0;
-        isHoldingJump = true;
-        djRemaining--;
+      } else if (djLeft > 0 && p.jumpsLeft === 0) {
+        p.vy = JUMP_FORCE * 0.88;
+        p.jumpsLeft = -1; // used double jump
+        djLeft--;
+        holdFrames = 0;
+        holding = true;
         playSound('jump');
-        spawnParticles(
-          player.x + player.w / 2,
-          player.y + player.h / 2,
-          'hsl(145 70% 50%)',
-          14,
-          7,
-        );
       }
     };
 
-    const onDown = (e: Event) => {
+    const onPointerDown = (e: Event) => {
       e.preventDefault();
-      if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
-        audioCtxRef.current.resume();
-      }
+      if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume();
       doJump();
     };
-    const onUp = () => {
-      isHoldingJump = false;
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
-        e.preventDefault();
-        doJump();
-        isHoldingJump = true;
-      }
+    const onPointerUp = () => { holding = false; };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); doJump(); holding = true; }
       if (e.code === 'KeyP') onPause();
     };
     const onKeyUp = (e: KeyboardEvent) => {
-      if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
-        isHoldingJump = false;
-      }
+      if (e.code === 'Space' || e.code === 'ArrowUp') holding = false;
     };
 
-    canvas.addEventListener('mousedown', onDown);
-    canvas.addEventListener('mouseup', onUp);
-    canvas.addEventListener('touchstart', onDown, { passive: false });
-    canvas.addEventListener('touchend', onUp);
-    window.addEventListener('keydown', onKey);
+    canvas.addEventListener('mousedown', onPointerDown);
+    canvas.addEventListener('mouseup', onPointerUp);
+    canvas.addEventListener('touchstart', onPointerDown, { passive: false });
+    canvas.addEventListener('touchend', onPointerUp);
+    window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
 
-    // -------- Spawners --------
-    // Distance-based spawning — more predictable than time-based with variable speed
-    let distSinceObstacle = 0;
-    let distSinceToken = 0;
+    // ── Background stars (pre-computed, just scrolled) ─────────────────
+    const STAR_COUNT = 40;
+    const stars = Array.from({ length: STAR_COUNT }, () => ({
+      x: Math.random() * W,
+      y: Math.random() * (GROUND - 30),
+      r: 0.5 + Math.random() * 1.2,
+      spd: 0.3 + Math.random() * 0.5,
+    }));
 
-    const spawnObstacle = () => {
-      const r = Math.random();
-      let type: ObstacleType;
-      let w: number;
-      let h: number;
-      let y: number;
-      if (r < 0.5) {
-        type = 'spike';
-        w = 28;
-        h = 40;
-        y = GROUND_Y - h;
-      } else if (r < 0.75) {
-        type = 'tall';
-        w = 30;
-        h = 70;
-        y = GROUND_Y - h;
-      } else if (r < 0.9) {
-        type = 'saw';
-        w = 38;
-        h = 38;
-        y = GROUND_Y - h;
-      } else {
-        type = 'drone';
-        w = 44;
-        h = 28;
-        y = GROUND_Y - 120 - Math.random() * 30;
-      }
-      obstacles.push({ x: W + 40, y, w, h, type, phase: 0 });
+    // ── Throttled React state updates ──────────────────────────────────
+    let lastReactUpdate = 0;
+    const REACT_UPDATE_INTERVAL = 160; // ms
+
+    // ── Ground line decoration ─────────────────────────────────────────
+    let groundOffset = 0;
+
+    // ── Trail ──────────────────────────────────────────────────────────
+    const trail: { x: number; y: number }[] = [];
+
+    // ── Collision helper ───────────────────────────────────────────────
+    const MARGIN = 6;
+    const hits = (o: Obs) =>
+      p.x + MARGIN < o.x + o.w &&
+      p.x + PLAYER_W - MARGIN > o.x &&
+      p.y + MARGIN < o.y + o.h &&
+      p.y + PLAYER_H - MARGIN > o.y;
+
+    // ── Draw helpers ───────────────────────────────────────────────────
+    const rrect = (x: number, y: number, w: number, h: number, r: number) => {
+      const cr = Math.min(r, w / 2, h / 2);
+      ctx.beginPath();
+      ctx.moveTo(x + cr, y);
+      ctx.lineTo(x + w - cr, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + cr);
+      ctx.lineTo(x + w, y + h - cr);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - cr, y + h);
+      ctx.lineTo(x + cr, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - cr);
+      ctx.lineTo(x, y + cr);
+      ctx.quadraticCurveTo(x, y, x + cr, y);
+      ctx.closePath();
     };
 
-    const spawnTokenLine = () => {
-      // Small, readable patterns of 3 tokens
-      const baseX = W + 60;
-      const pattern = Math.floor(Math.random() * 3);
-      const count = 3;
-      for (let i = 0; i < count; i++) {
-        let y: number;
-        if (pattern === 0) {
-          // low line — pick up while running
-          y = GROUND_Y - 40;
-        } else if (pattern === 1) {
-          // arc (jump-height)
-          const t = i / (count - 1);
-          y = GROUND_Y - 80 - Math.sin(t * Math.PI) * 50;
-        } else {
-          // high line — needs a jump to reach
-          y = GROUND_Y - 110;
-        }
-        tokens.push({ x: baseX + i * 34, y, collected: false, bob: Math.random() * Math.PI * 2 });
-      }
-    };
-
-    const rectHit = (ax: number, ay: number, aw: number, ah: number, o: Obstacle) => {
-      const m = 5;
-      return ax + m < o.x + o.w && ax + aw - m > o.x && ay + m < o.y + o.h && ay + ah - m > o.y;
-    };
-
+    // ── Main loop ─────────────────────────────────────────────────────
     let animId = 0;
+    let lastTime = 0;
 
-    const update = () => {
-      const now = performance.now();
+    const loop = (now: number) => {
+      animId = requestAnimationFrame(loop);
 
-      // Start the first timed power-up after grace period
-      if (!firstTimedStarted && now >= firstTimedAt) {
-        firstTimedStarted = true;
-        if (timedQueue.length > 0) startNextTimed(now);
+      // Cap delta so a tab-switch doesn't cause a giant jump
+      const rawDt = now - lastTime;
+      lastTime = now;
+      if (rawDt < 1) return; // first frame
+
+      // Clamp dt: treat anything > 50ms as 50ms (e.g. when tab is backgrounded)
+      const dt = Math.min(rawDt, 50) / (1000 / 60); // normalized to ~1 at 60fps
+
+      if (pausedRef.current) {
+        // Still draw the paused frame
+        drawFrame(now);
+        return;
       }
 
-      // Expire timed power-up -> start next one from the queue
-      if (activeTimed && now >= activeTimedEnd) {
-        activeTimed = null;
-        if (timedQueue.length > 0) startNextTimed(now);
+      // ── Update ──────────────────────────────────────────────────────
+
+      if (gameStartTime === 0) gameStartTime = now;
+
+      // Timed power-up queue
+      if (!timedQueueStarted && now - gameStartTime > TIMED_GRACE_MS) {
+        timedQueueStarted = true;
+        activateNextTimed(now);
       }
+      if (magnetActive && now > magnetEnd) { magnetActive = false; activateNextTimed(now); }
+      if (slowmoActive && now > slowmoEnd) { slowmoActive = false; activateNextTimed(now); }
+      if (rocketActive && now > rocketEnd) { rocketActive = false; p.onGround = false; activateNextTimed(now); }
 
-      const magnetOn = activeTimed === 'magnet';
-      const slowmoOn = activeTimed === 'slowmo';
-      const rocketOn = activeTimed === 'rocket';
+      const effSpeed = rocketActive ? speed * 1.5 : slowmoActive ? speed * 0.5 : speed;
 
-      const effSpeed = rocketOn ? speed * 1.6 : slowmoOn ? speed * 0.55 : speed;
-
-      // Variable jump height
-      if (isHoldingJump && jumpHold < MAX_HOLD && player.vy < 0) {
-        player.vy -= 0.5;
-        jumpHold++;
-      }
-
-      // Auto-jump
-      if (autoJumpRemaining > 0 && obstacles.length > 0 && player.onGround) {
-        const next = obstacles.find((o) => o.x + o.w > player.x);
-        if (next) {
-          const dist = next.x - (player.x + player.w);
-          if (dist > 90 && dist < 160 && now - lastAutoJump > 500) {
-            doJump();
-            autoJumpRemaining--;
-            lastAutoJump = now;
-          }
-        }
-      }
-
-      // Rocket: float at mid-air
-      if (rocketOn) {
-        const target = GROUND_Y - 170;
-        player.y += (target - player.y) * 0.2;
-        player.vy = 0;
-        player.onGround = false;
+      // ── Player physics ──────────────────────────────────────────────
+      if (rocketActive) {
+        // Float at a fixed height
+        const targetY = GROUND - PLAYER_H - 100;
+        p.y += (targetY - p.y) * 0.15 * dt;
+        p.vy = 0;
+        p.onGround = false;
       } else {
-        player.vy += GRAVITY;
-        if (player.vy > 20) player.vy = 20;
-        player.y += player.vy;
-        if (player.y >= GROUND_Y - player.h) {
-          player.y = GROUND_Y - player.h;
-          player.vy = 0;
-          if (!player.onGround) {
-            spawnParticles(player.x + player.w / 2, GROUND_Y, 'hsl(190 95% 50%)', 6, 4);
-          }
-          player.onGround = true;
-          player.jumpsUsed = 0;
-          jumpHold = 0;
+        // Hold-to-jump: add upward boost while holding and still rising
+        if (holding && holdFrames < MAX_HOLD_FRAMES && p.vy < 0) {
+          p.vy += HOLD_BONUS * dt;
+          holdFrames += dt;
+        }
+        p.vy = Math.min(p.vy + GRAVITY * dt, TERMINAL_VEL);
+        p.y += p.vy * dt;
+
+        // Ground snap
+        if (p.y >= GROUND - PLAYER_H) {
+          p.y = GROUND - PLAYER_H;
+          p.vy = 0;
+          p.onGround = true;
+          p.jumpsLeft = 1;
+          holdFrames = 0;
         }
       }
 
       // Trail
-      player.trail.push({ x: player.x + player.w / 2, y: player.y + player.h / 2 });
-      if (player.trail.length > 12) player.trail.shift();
+      trail.push({ x: p.x + PLAYER_W / 2, y: p.y + PLAYER_H / 2 });
+      if (trail.length > 10) trail.shift();
 
-      // Gentle speed ramp (was too aggressive before)
-      speed = Math.min(speed + 0.0006, 9);
-
-      // Move obstacles
-      obstacles.forEach((o) => {
-        o.x -= effSpeed;
-        o.phase += 0.1;
-        if (o.type === 'drone') o.y += Math.sin(o.phase) * 0.5;
-      });
-      obstacles = obstacles.filter((o) => o.x + o.w > -40);
-
-      // Distance-based obstacle spawn — scales gap with speed so game stays readable
-      distSinceObstacle += effSpeed;
-      const minGap = Math.max(240, 360 - speed * 8);
-      const maxGap = minGap + 200;
-      if (distSinceObstacle > minGap + Math.random() * (maxGap - minGap)) {
-        spawnObstacle();
-        distSinceObstacle = 0;
+      // ── Auto-jump ───────────────────────────────────────────────────
+      if (autoLeft > 0 && p.onGround) {
+        const next = obstacles.find((o) => o.x + o.w > p.x);
+        if (next) {
+          const dist = next.x - (p.x + PLAYER_W);
+          if (dist > 60 && dist < 160 && now - lastAutoJumpAt > 600) {
+            doJump();
+            autoLeft--;
+            lastAutoJumpAt = now;
+          }
+        }
       }
+
+      // ── Speed ramp ─────────────────────────────────────────────────
+      speed = Math.min(speed + SPEED_RAMP * dt, SPEED_MAX);
+      score += 0.08 * effSpeed * dt; // score tied to distance
+
+      // ── Obstacles ──────────────────────────────────────────────────
+      for (const o of obstacles) {
+        o.x -= effSpeed * dt;
+        if (o.drone) o.phase += 0.08 * dt;
+        if (o.drone) o.y = (o.y - 0.5 * dt) + Math.sin(o.phase) * 0.8 * dt + 0.25 * dt;
+      }
+      obstacles = obstacles.filter((o) => o.x + o.w > -20);
+
+      distSinceObs += effSpeed * dt;
+      if (distSinceObs >= obsGap()) { spawnObs(); distSinceObs = 0; }
+
+      // ── Tokens ─────────────────────────────────────────────────────
+      for (const tk of tokens) {
+        tk.x -= effSpeed * dt;
+        tk.bob += 0.1 * dt;
+        if (magnetActive) {
+          const dx = (p.x + PLAYER_W / 2) - tk.x;
+          const dy = (p.y + PLAYER_H / 2) - tk.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist < 220 && dist > 1) {
+            const pull = (1 - dist / 220) * 6 * dt;
+            tk.x += (dx / dist) * pull;
+            tk.y += (dy / dist) * pull;
+          }
+        }
+      }
+      tokens = tokens.filter((tk) => !tk.taken && tk.x > -20);
+
+      distSinceTok += effSpeed * dt;
+      if (distSinceTok >= tokGap()) { spawnToks(); distSinceTok = 0; }
+
+      // ── Token collection ───────────────────────────────────────────
+      for (const tk of tokens) {
+        const dx = tk.x - (p.x + PLAYER_W / 2);
+        const dy = tk.y - (p.y + PLAYER_H / 2);
+        if (Math.hypot(dx, dy) < 24) {
+          tk.taken = true;
+          jumpTokens += 5;
+          playSound('coin');
+        }
+      }
+
+      // ── Collision ──────────────────────────────────────────────────
+      for (const o of obstacles) {
+        if (!hits(o)) continue;
+        if (rocketActive) {
+          // Rocket destroys obstacles
+          o.x = -9999;
+          playSound('hit');
+          continue;
+        }
+        if (shieldLeft > 0) {
+          shieldLeft--;
+          o.x = -9999;
+          // Clear nearby obstacles too
+          obstacles.forEach((other) => { if (Math.abs(other.x - p.x) < 160) other.x = -9999; });
+          playSound('powerup');
+          continue;
+        }
+        // Dead
+        alive = false;
+        playSound('hit');
+        cbRef.current.onGameOver(Math.floor(score), jumpTokens);
+        cancelAnimationFrame(animId);
+        drawFrame(now); // draw final death frame
+        cleanup();
+        return;
+      }
+
+      // ── Background scroll ─────────────────────────────────────────
+      for (const s of stars) {
+        s.x -= s.spd * dt;
+        if (s.x < -2) s.x = W + 2;
+      }
+      groundOffset = (groundOffset + effSpeed * dt) % 40;
+
+      // ── Throttled React updates (score + jump bank) ────────────────
+      if (now - lastReactUpdate > REACT_UPDATE_INTERVAL) {
+        lastReactUpdate = now;
+        cbRef.current.onScoreUpdate(Math.floor(score));
+        cbRef.current.onJumpCollected(jumpTokens);
+      }
+
+      drawFrame(now);
+    };
+
+    // ── Draw ─────────────────────────────────────────────────────────
+    const drawFrame = (now: number) => {
+      ctx.clearRect(0, 0, W, H);
+
+      // Sky gradient
+      const sky = ctx.createLinearGradient(0, 0, 0, GROUND);
+      sky.addColorStop(0, '#050b14');
+      sky.addColorStop(1, '#0a1628');
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, W, GROUND);
+
+      // Stars
+      ctx.fillStyle = '#ffffff';
+      for (const s of stars) {
+        ctx.globalAlpha = 0.6 + 0.4 * Math.sin(now * 0.001 + s.x);
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+      // Ground
+      ctx.fillStyle = '#0d1f3c';
+      ctx.fillRect(0, GROUND, W, H - GROUND);
+      // Ground glow line
+      ctx.strokeStyle = '#06b6d4';
+      ctx.lineWidth = 2;
+      ctx.shadowColor = '#06b6d4';
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.moveTo(0, GROUND);
+      ctx.lineTo(W, GROUND);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // Ground dashes
+      ctx.strokeStyle = 'rgba(6,182,212,0.25)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([20, 20]);
+      ctx.lineDashOffset = -groundOffset;
+      ctx.beginPath();
+      ctx.moveTo(0, GROUND + 14);
+      ctx.lineTo(W, GROUND + 14);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.lineDashOffset = 0;
+
+      // Trail
+      for (let i = 0; i < trail.length; i++) {
+        const t = trail[i];
+        const a = (i / trail.length) * 0.5;
+        ctx.globalAlpha = a;
+        ctx.fillStyle = rocketActive ? '#f59e0b' : '#06b6d4';
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, 3 + (i / trail.length) * 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
 
       // Tokens
-      tokens.forEach((c) => {
-        c.x -= effSpeed;
-        c.bob += 0.14;
-        if (magnetOn) {
-          const dx = player.x + player.w / 2 - c.x;
-          const dy = player.y + player.h / 2 - c.y;
-          const dist = Math.hypot(dx, dy);
-          if (dist < 240) {
-            const pull = (1 - dist / 240) * 5;
-            c.x += (dx / dist) * pull;
-            c.y += (dy / dist) * pull;
-          }
-        }
-      });
-      tokens = tokens.filter((c) => !c.collected && c.x > -40);
-
-      distSinceToken += effSpeed;
-      if (distSinceToken > 420 + Math.random() * 300) {
-        spawnTokenLine();
-        distSinceToken = 0;
-      }
-
-      // Token pickups
-      for (const c of tokens) {
-        const dx = c.x - (player.x + player.w / 2);
-        const dy = c.y - (player.y + player.h / 2);
-        if (Math.hypot(dx, dy) < 26) {
-          c.collected = true;
-          jumpCount += 10; // each pickup = 10 $JUMP
-          playSound('coin');
-          spawnParticles(c.x, c.y, 'hsl(35 95% 58%)', 6, 3);
-        }
-      }
-
-      // Obstacle collision
-      for (const o of obstacles) {
-        if (rectHit(player.x, player.y, player.w, player.h, o)) {
-          if (rocketOn) {
-            spawnParticles(o.x + o.w / 2, o.y + o.h / 2, 'hsl(35 95% 58%)', 20, 9);
-            o.x = -9999;
-            cameraShake = 6;
-            playSound('hit');
-            continue;
-          }
-          if (shieldCharges > 0) {
-            shieldCharges--;
-            spawnParticles(
-              player.x + player.w / 2,
-              player.y + player.h / 2,
-              'hsl(190 95% 50%)',
-              28,
-              10,
-            );
-            obstacles.forEach((other) => {
-              if (Math.abs(other.x - player.x) < 180) other.x = -9999;
-            });
-            cameraShake = 8;
-            playSound('powerup');
-            continue;
-          }
-          gameActive = false;
-          cameraShake = 14;
-          playSound('hit');
-          spawnParticles(
-            player.x + player.w / 2,
-            player.y + player.h / 2,
-            'hsl(0 84% 60%)',
-            26,
-            10,
-          );
-          cbRef.current.onGameOver(Math.floor(score), jumpCount);
-          return;
-        }
-      }
-
-      // Particles
-      particles.forEach((p) => {
-        p.x += p.vx;
-        p.y += p.vy;
-        p.vy += 0.35;
-        p.life -= 0.022;
-      });
-      particles = particles.filter((p) => p.life > 0);
-
-      // Background layers
-      stars.forEach((s) => {
-        s.x -= s.speed;
-        s.twinkle += 0.04;
-        if (s.x < -4) {
-          s.x = W + 4;
-          s.y = Math.random() * (GROUND_Y - 40);
-        }
-      });
-      mountains.forEach((m) => {
-        m.x -= effSpeed * 0.12;
-        if (m.x + m.w < -20) {
-          m.x = W + Math.random() * 80;
-          m.w = 160 + Math.random() * 120;
-          m.h = 80 + Math.random() * 120;
-        }
-      });
-
-      // Scoring
-      const gain = rocketOn ? 2.2 : 1;
-      score += gain;
-
-      // Throttled React state updates (150ms) — was the main source of "hanging"
-      if (now - lastScoreSent > STATE_UPDATE_MS) {
-        cbRef.current.onScoreUpdate(Math.floor(score));
-        lastScoreSent = now;
-      }
-      if (now - lastTokenSent > STATE_UPDATE_MS) {
-        cbRef.current.onJumpCollected(jumpCount);
-        lastTokenSent = now;
-      }
-
-      if (cameraShake > 0) cameraShake *= 0.88;
-    };
-
-    // -------- Drawing --------
-    const drawPlayer = () => {
-      const now = performance.now();
-      const rocketOn = activeTimed === 'rocket';
-      const magnetOn = activeTimed === 'magnet';
-      const slowmoOn = activeTimed === 'slowmo';
-
-      for (let i = 0; i < player.trail.length; i++) {
-        const t = player.trail[i];
-        const a = i / player.trail.length;
-        ctx.globalAlpha = a * 0.5;
-        ctx.fillStyle = rocketOn ? 'hsl(35 95% 58%)' : 'hsl(190 95% 50%)';
+      for (const tk of tokens) {
+        if (tk.taken) continue;
+        const ty = tk.y + Math.sin(tk.bob) * 4;
+        ctx.save();
+        ctx.shadowColor = '#f59e0b';
+        ctx.shadowBlur = 12;
+        // Coin circle
+        ctx.fillStyle = '#f59e0b';
         ctx.beginPath();
-        ctx.arc(t.x, t.y, 4 + a * 4, 0, Math.PI * 2);
+        ctx.arc(tk.x, ty, 10, 0, Math.PI * 2);
         ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-
-      const px = player.x;
-      const py = player.y;
-      const pw = player.w;
-      const ph = player.h;
-      const cx = px + pw / 2;
-      const cy = py + ph / 2;
-      const r = pw / 2;
-
-      ctx.shadowColor = rocketOn ? 'hsl(35 95% 58%)' : 'hsl(190 95% 50%)';
-      ctx.shadowBlur = 22;
-
-      ctx.fillStyle = rocketOn ? 'hsl(35 95% 58%)' : 'hsl(190 95% 50%)';
-      ctx.beginPath();
-      for (let i = 0; i < 6; i++) {
-        const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
-        const x = cx + Math.cos(a) * r;
-        const y = cy + Math.sin(a) * r;
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
-      ctx.closePath();
-      ctx.fill();
-
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = 'hsl(222 47% 5%)';
-      ctx.beginPath();
-      ctx.arc(cx, cy, r * 0.55, 0, Math.PI * 2);
-      ctx.fill();
-
-      // "J" for JUMP
-      ctx.fillStyle = rocketOn ? 'hsl(35 95% 58%)' : 'hsl(190 95% 50%)';
-      ctx.font = 'bold 18px ui-sans-serif, system-ui';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('J', cx, cy + 1);
-      ctx.textAlign = 'start';
-      ctx.textBaseline = 'alphabetic';
-
-      if (shieldCharges > 0) {
-        ctx.strokeStyle = `hsl(190 95% 50% / ${0.5 + Math.sin(now * 0.01) * 0.3})`;
-        ctx.lineWidth = 3;
+        // Inner circle
+        ctx.fillStyle = '#fbbf24';
         ctx.beginPath();
-        ctx.arc(cx, cy, r + 10, 0, Math.PI * 2);
-        ctx.stroke();
+        ctx.arc(tk.x, ty, 7, 0, Math.PI * 2);
+        ctx.fill();
+        // "J" label
+        ctx.fillStyle = '#78350f';
+        ctx.font = 'bold 9px ui-sans-serif, system-ui';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('J', tk.x, ty);
+        ctx.restore();
       }
 
-      if (magnetOn) {
-        ctx.strokeStyle = `hsl(320 90% 60% / ${0.3 + Math.sin(now * 0.008) * 0.2})`;
-        ctx.lineWidth = 2;
-        ctx.setLineDash([6, 6]);
-        ctx.beginPath();
-        ctx.arc(cx, cy, 200, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-
-      if (slowmoOn) {
-        ctx.strokeStyle = `hsl(190 95% 50% / ${0.2 + Math.sin(now * 0.005) * 0.15})`;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(cx, cy, r + 16 + Math.sin(now * 0.01) * 4, 0, Math.PI * 2);
-        ctx.stroke();
-      }
-
-      if (rocketOn) {
-        ctx.fillStyle = 'hsl(35 95% 58%)';
-        for (let i = 0; i < 4; i++) {
-          ctx.globalAlpha = 0.6 - i * 0.14;
+      // Obstacles
+      for (const o of obstacles) {
+        if (o.x < -20 || o.x > W + 20) continue;
+        ctx.save();
+        if (o.drone) {
+          // Drone: glowing magenta box
+          ctx.shadowColor = '#e879a0';
+          ctx.shadowBlur = 14;
+          ctx.fillStyle = '#831843';
+          rrect(o.x, o.y, o.w, o.h, 5);
+          ctx.fill();
+          ctx.strokeStyle = '#e879a0';
+          ctx.lineWidth = 1.5;
+          rrect(o.x, o.y, o.w, o.h, 5);
+          ctx.stroke();
+          // Propeller lines
+          ctx.strokeStyle = '#f472b6';
+          ctx.lineWidth = 2;
           ctx.beginPath();
-          ctx.ellipse(px - 6 - i * 8, cy, 4, 10 + i * 2, 0, 0, Math.PI * 2);
+          ctx.moveTo(o.x + 8, o.y - 4); ctx.lineTo(o.x + 8, o.y);
+          ctx.moveTo(o.x + o.w - 8, o.y - 4); ctx.lineTo(o.x + o.w - 8, o.y);
+          ctx.stroke();
+        } else {
+          // Ground obstacle
+          ctx.shadowColor = '#ef4444';
+          ctx.shadowBlur = 14;
+          ctx.fillStyle = '#7f1d1d';
+          rrect(o.x, o.y, o.w, o.h, 4);
+          ctx.fill();
+          ctx.strokeStyle = '#ef4444';
+          ctx.lineWidth = 1.5;
+          rrect(o.x, o.y, o.w, o.h, 4);
+          ctx.stroke();
+          // spike top
+          ctx.fillStyle = '#ef4444';
+          ctx.beginPath();
+          ctx.moveTo(o.x + o.w / 2 - 5, o.y);
+          ctx.lineTo(o.x + o.w / 2, o.y - 10);
+          ctx.lineTo(o.x + o.w / 2 + 5, o.y);
+          ctx.closePath();
           ctx.fill();
         }
+        ctx.restore();
+      }
+
+      // Player
+      ctx.save();
+      const px = p.x;
+      const py = p.y;
+      const pw = PLAYER_W;
+      const ph = PLAYER_H;
+
+      // Shield aura
+      if (shieldLeft > 0) {
+        ctx.strokeStyle = '#06b6d4';
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = '#06b6d4';
+        ctx.shadowBlur = 20;
+        ctx.beginPath();
+        ctx.arc(px + pw / 2, py + ph / 2, pw / 2 + 10, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+
+      // Body glow
+      ctx.shadowColor = rocketActive ? '#f59e0b' : magnetActive ? '#e879a0' : '#06b6d4';
+      ctx.shadowBlur = rocketActive ? 30 : 18;
+
+      // Body
+      ctx.fillStyle = rocketActive ? '#f59e0b' : '#0ea5e9';
+      rrect(px + 4, py, pw - 8, ph, 8);
+      ctx.fill();
+
+      // Head
+      ctx.fillStyle = rocketActive ? '#fbbf24' : '#38bdf8';
+      rrect(px + 7, py + 4, pw - 14, ph * 0.45, 6);
+      ctx.fill();
+
+      // Eye
+      ctx.fillStyle = '#0f172a';
+      ctx.beginPath();
+      ctx.arc(px + pw / 2 + 5, py + 14, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(px + pw / 2 + 6, py + 13, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Legs
+      ctx.fillStyle = rocketActive ? '#d97706' : '#0284c7';
+      rrect(px + 6, py + ph - 14, 10, 14, 3); ctx.fill();
+      rrect(px + pw - 16, py + ph - 14, 10, 14, 3); ctx.fill();
+
+      // Rocket flame
+      if (rocketActive) {
+        ctx.fillStyle = '#fde68a';
+        ctx.globalAlpha = 0.8 + 0.2 * Math.sin(now * 0.02);
+        ctx.beginPath();
+        ctx.moveTo(px + 8, py + ph);
+        ctx.lineTo(px + pw / 2, py + ph + 18 + Math.random() * 6);
+        ctx.lineTo(px + pw - 8, py + ph);
+        ctx.closePath();
+        ctx.fill();
         ctx.globalAlpha = 1;
       }
-    };
-
-    const drawObstacle = (o: Obstacle) => {
-      ctx.save();
-      const now = performance.now();
-      if (o.type === 'spike') {
-        const grad = ctx.createLinearGradient(o.x, o.y, o.x, o.y + o.h);
-        grad.addColorStop(0, 'hsl(0 84% 70%)');
-        grad.addColorStop(1, 'hsl(0 84% 45%)');
-        ctx.shadowColor = 'hsl(0 84% 60%)';
-        ctx.shadowBlur = 14;
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.moveTo(o.x, o.y + o.h);
-        ctx.lineTo(o.x + o.w / 2, o.y);
-        ctx.lineTo(o.x + o.w, o.y + o.h);
-        ctx.closePath();
-        ctx.fill();
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = 'hsl(0 84% 30%)';
-        ctx.fillRect(o.x - 2, o.y + o.h - 4, o.w + 4, 4);
-      } else if (o.type === 'tall') {
-        const grad = ctx.createLinearGradient(o.x, o.y, o.x + o.w, o.y);
-        grad.addColorStop(0, 'hsl(320 90% 35%)');
-        grad.addColorStop(0.5, 'hsl(320 90% 55%)');
-        grad.addColorStop(1, 'hsl(320 90% 35%)');
-        ctx.shadowColor = 'hsl(320 90% 60%)';
-        ctx.shadowBlur = 14;
-        ctx.fillStyle = grad;
-        ctx.fillRect(o.x, o.y, o.w, o.h);
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = 'hsl(320 90% 70%)';
-        ctx.fillRect(o.x - 2, o.y, o.w + 4, 6);
-        ctx.fillStyle = 'hsl(222 47% 5%)';
-        for (let i = 1; i < 4; i++) {
-          ctx.fillRect(o.x + 4, o.y + (o.h / 4) * i, o.w - 8, 2);
-        }
-      } else if (o.type === 'drone') {
-        ctx.shadowColor = 'hsl(35 95% 58%)';
-        ctx.shadowBlur = 16;
-        ctx.fillStyle = 'hsl(35 95% 58%)';
-        ctx.beginPath();
-        ctx.ellipse(o.x + o.w / 2, o.y + o.h / 2, o.w / 2, o.h / 2, 0, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = 'hsl(222 47% 5%)';
-        ctx.beginPath();
-        ctx.arc(o.x + o.w / 2, o.y + o.h / 2, o.h / 4, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = 'hsl(0 84% 60%)';
-        ctx.beginPath();
-        ctx.arc(o.x + o.w / 2, o.y + o.h / 2, 3, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = 'hsl(35 95% 58%)';
-        ctx.lineWidth = 2;
-        const prop = Math.sin(now * 0.05) * 10;
-        ctx.beginPath();
-        ctx.moveTo(o.x - 4, o.y + 4);
-        ctx.lineTo(o.x + 4 + prop, o.y - 2);
-        ctx.moveTo(o.x + o.w + 4, o.y + 4);
-        ctx.lineTo(o.x + o.w - 4 - prop, o.y - 2);
-        ctx.stroke();
-      } else if (o.type === 'saw') {
-        ctx.shadowColor = 'hsl(190 95% 50%)';
-        ctx.shadowBlur = 16;
-        const cx = o.x + o.w / 2;
-        const cy = o.y + o.h / 2;
-        const rad = o.w / 2;
-        ctx.fillStyle = 'hsl(190 95% 50%)';
-        ctx.beginPath();
-        for (let i = 0; i < 12; i++) {
-          const a = (i / 12) * Math.PI * 2 + o.phase;
-          const rr = i % 2 === 0 ? rad : rad * 0.7;
-          const x = cx + Math.cos(a) * rr;
-          const y = cy + Math.sin(a) * rr;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
-        ctx.closePath();
-        ctx.fill();
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = 'hsl(222 47% 5%)';
-        ctx.beginPath();
-        ctx.arc(cx, cy, rad * 0.4, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.restore();
-    };
-
-    const drawToken = (c: Token) => {
-      const now = performance.now();
-      const pulse = 1 + Math.sin(c.bob) * 0.08;
-      ctx.save();
-      ctx.shadowColor = 'hsl(35 95% 58%)';
-      ctx.shadowBlur = 14;
-
-      // outer coin
-      ctx.fillStyle = 'hsl(35 95% 58%)';
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, 12 * pulse, 0, Math.PI * 2);
-      ctx.fill();
-
-      // inner disc
       ctx.shadowBlur = 0;
-      ctx.fillStyle = 'hsl(222 47% 5%)';
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, 9 * pulse, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.restore();
 
-      // "J" logo
-      ctx.fillStyle = 'hsl(35 95% 58%)';
-      ctx.font = 'bold 11px ui-sans-serif, system-ui';
-      ctx.textAlign = 'center';
+      // HUD: active power-up badge
+      const activeName = rocketActive ? 'ROCKET' : slowmoActive ? 'SLOW-MO' : magnetActive ? 'MAGNET' : null;
+      const activeEnd = rocketActive ? rocketEnd : slowmoActive ? slowmoEnd : magnetActive ? magnetEnd : 0;
+
+      if (activeName && activeEnd > 0) {
+        const remaining = Math.max(0, activeEnd - now);
+        const dur = rocketActive ? TIMED_DUR.rocket : slowmoActive ? TIMED_DUR.slowmo : TIMED_DUR.magnet;
+        const frac = remaining / dur;
+        const bx = W / 2 - 60;
+        const by = 12;
+        const bw = 120;
+        const bh = 22;
+        ctx.fillStyle = 'rgba(5,15,30,0.85)';
+        rrect(bx, by, bw, bh, 6);
+        ctx.fill();
+        // Progress bar fill
+        ctx.fillStyle = rocketActive ? '#f59e0b' : slowmoActive ? '#06b6d4' : '#e879a0';
+        rrect(bx + 2, by + 2, (bw - 4) * frac, bh - 4, 4);
+        ctx.fill();
+        // Label
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 10px ui-sans-serif, system-ui';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(activeName, bx + bw / 2, by + bh / 2);
+      }
+
+      // HUD: score top-right
+      ctx.fillStyle = 'rgba(5,15,30,0.75)';
+      rrect(W - 110, 10, 100, 28, 6);
+      ctx.fill();
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = 'bold 9px ui-sans-serif, system-ui';
+      ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      ctx.fillText('J', c.x, c.y + 1);
-      ctx.textAlign = 'start';
-      ctx.textBaseline = 'alphabetic';
+      ctx.fillText('SCORE', W - 105, 20);
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = 'bold 13px ui-sans-serif, system-ui';
+      ctx.fillText(Math.floor(score).toString(), W - 105, 31);
 
-      // pulsing ring
-      ctx.strokeStyle = `hsl(35 95% 58% / ${0.25 + Math.sin(now * 0.008 + c.bob) * 0.2})`;
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, 16 + Math.sin(c.bob * 1.2) * 2, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-    };
-
-    const draw = () => {
-      const now = performance.now();
-      const rocketOn = activeTimed === 'rocket';
-      const slowmoOn = activeTimed === 'slowmo';
-      const magnetOn = activeTimed === 'magnet';
-
-      const shakeX = (Math.random() - 0.5) * cameraShake;
-      const shakeY = (Math.random() - 0.5) * cameraShake;
-
-      const skyGrad = ctx.createLinearGradient(0, 0, 0, H);
-      skyGrad.addColorStop(0, 'hsl(222 47% 5%)');
-      skyGrad.addColorStop(0.5, 'hsl(222 50% 10%)');
-      skyGrad.addColorStop(1, 'hsl(222 55% 16%)');
-      ctx.fillStyle = skyGrad;
-      ctx.fillRect(0, 0, W, H);
-
-      ctx.save();
-      ctx.translate(shakeX, shakeY);
-
-      stars.forEach((s) => {
-        const alpha = 0.4 + Math.sin(s.twinkle) * 0.4;
-        ctx.fillStyle = `hsl(190 95% 80% / ${alpha})`;
-        ctx.fillRect(s.x, s.y, s.size, s.size);
-      });
-
-      mountains.forEach((m) => {
-        ctx.fillStyle = `hsl(222 40% ${12 + m.shade * 8}%)`;
-        ctx.beginPath();
-        ctx.moveTo(m.x, GROUND_Y);
-        ctx.lineTo(m.x + m.w / 2, GROUND_Y - m.h);
-        ctx.lineTo(m.x + m.w, GROUND_Y);
-        ctx.closePath();
+      // HUD: shield indicator
+      if (shieldLeft > 0) {
+        ctx.fillStyle = 'rgba(6,182,212,0.15)';
+        rrect(W - 110, 44, 100, 22, 6);
         ctx.fill();
-        ctx.strokeStyle = 'hsl(190 95% 50% / 0.2)';
+        ctx.strokeStyle = 'rgba(6,182,212,0.6)';
         ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(m.x, GROUND_Y);
-        ctx.lineTo(m.x + m.w / 2, GROUND_Y - m.h);
-        ctx.lineTo(m.x + m.w, GROUND_Y);
+        rrect(W - 110, 44, 100, 22, 6);
         ctx.stroke();
-      });
-
-      ctx.strokeStyle = 'hsl(190 95% 50% / 0.15)';
-      ctx.lineWidth = 1;
-      const horizonY = GROUND_Y;
-      for (let i = 0; i < 10; i++) {
-        const y = horizonY + i * 8 + i * i * 0.8;
-        if (y > H) break;
-        ctx.globalAlpha = 1 - i / 10;
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(W, y);
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 0.4;
-      const vpX = W / 2;
-      const offset = (performance.now() * 0.06) % 40;
-      for (let i = -12; i < 12; i++) {
-        ctx.beginPath();
-        ctx.moveTo(vpX + i * 40 + offset, horizonY);
-        ctx.lineTo(vpX + i * 160, H);
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-
-      ctx.strokeStyle = 'hsl(190 95% 50% / 0.55)';
-      ctx.lineWidth = 2;
-      ctx.shadowColor = 'hsl(190 95% 50%)';
-      ctx.shadowBlur = 8;
-      ctx.beginPath();
-      ctx.moveTo(0, GROUND_Y);
-      ctx.lineTo(W, GROUND_Y);
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-
-      if (slowmoOn) {
-        ctx.fillStyle = 'hsl(190 95% 50% / 0.08)';
-        ctx.fillRect(0, 0, W, H);
-      }
-      if (rocketOn) {
-        ctx.fillStyle = 'hsl(35 95% 58% / 0.08)';
-        ctx.fillRect(0, 0, W, H);
-      }
-
-      obstacles.forEach(drawObstacle);
-      tokens.forEach(drawToken);
-
-      particles.forEach((p) => {
-        ctx.globalAlpha = p.life;
-        ctx.fillStyle = p.color;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-        ctx.fill();
-      });
-      ctx.globalAlpha = 1;
-
-      drawPlayer();
-      ctx.restore();
-
-      // HUD
-      const roundedRect = (x: number, y: number, w: number, h: number, r: number) => {
-        ctx.beginPath();
-        ctx.moveTo(x + r, y);
-        ctx.lineTo(x + w - r, y);
-        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-        ctx.lineTo(x + w, y + h - r);
-        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-        ctx.lineTo(x + r, y + h);
-        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-        ctx.lineTo(x, y + r);
-        ctx.quadraticCurveTo(x, y, x + r, y);
-        ctx.closePath();
-      };
-
-      // Active power-up badge (timed)
-      ctx.font = 'bold 11px ui-sans-serif, system-ui';
-      let row = 0;
-      if (activeTimed) {
-        const color =
-          activeTimed === 'rocket'
-            ? 'hsl(35 95% 58%)'
-            : activeTimed === 'magnet'
-              ? 'hsl(320 90% 60%)'
-              : 'hsl(190 95% 50%)';
-        const label =
-          activeTimed === 'rocket' ? 'ROCKET' : activeTimed === 'magnet' ? 'MAGNET' : 'SLOW-MO';
-        const remaining = Math.max(0, Math.ceil((activeTimedEnd - now) / 1000));
-        // progress bar
-        const pct =
-          1 - (now - activeTimedStart) / (activeTimedEnd - activeTimedStart || 1);
-        const text = `${label} ${remaining}s`;
-        const w = ctx.measureText(text).width + 28;
-        const x = 14;
-        const y = 14 + row * 30;
-        ctx.fillStyle = 'hsl(222 40% 8% / 0.85)';
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1;
-        roundedRect(x, y, w, 22, 6);
-        ctx.fill();
-        ctx.stroke();
-        // bar
-        ctx.fillStyle = `${color.replace(')', ' / 0.25)').replace('hsl', 'hsl')}`;
-        roundedRect(x, y + 18, w * pct, 4, 2);
-        ctx.fill();
-        ctx.fillStyle = color;
-        ctx.fillText(text, x + 10, y + 14);
-        row++;
-      }
-      if (shieldCharges > 0) {
-        const x = 14;
-        const y = 14 + row * 30;
-        const text = `SHIELD ×${shieldCharges}`;
-        const w = ctx.measureText(text).width + 28;
-        ctx.fillStyle = 'hsl(222 40% 8% / 0.85)';
-        ctx.strokeStyle = 'hsl(190 95% 50%)';
-        ctx.lineWidth = 1;
-        roundedRect(x, y, w, 22, 6);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = 'hsl(190 95% 50%)';
-        ctx.fillText(text, x + 10, y + 14);
-        row++;
-      }
-      if (djRemaining > 0) {
-        const x = 14;
-        const y = 14 + row * 30;
-        const text = `2X JUMP ×${djRemaining}`;
-        const w = ctx.measureText(text).width + 28;
-        ctx.fillStyle = 'hsl(222 40% 8% / 0.85)';
-        ctx.strokeStyle = 'hsl(145 70% 50%)';
-        ctx.lineWidth = 1;
-        roundedRect(x, y, w, 22, 6);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = 'hsl(145 70% 50%)';
-        ctx.fillText(text, x + 10, y + 14);
-        row++;
-      }
-      if (autoJumpRemaining > 0) {
-        const x = 14;
-        const y = 14 + row * 30;
-        const text = `AUTO ×${autoJumpRemaining}`;
-        const w = ctx.measureText(text).width + 28;
-        ctx.fillStyle = 'hsl(222 40% 8% / 0.85)';
-        ctx.strokeStyle = 'hsl(145 70% 50%)';
-        ctx.lineWidth = 1;
-        roundedRect(x, y, w, 22, 6);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = 'hsl(145 70% 50%)';
-        ctx.fillText(text, x + 10, y + 14);
-        row++;
-      }
-
-      // Queue indicator (bottom-left): shows how many timed power-ups still waiting
-      if (timedQueue.length > 0) {
-        ctx.fillStyle = 'hsl(222 40% 8% / 0.85)';
-        ctx.strokeStyle = 'hsl(210 20% 96% / 0.25)';
-        ctx.lineWidth = 1;
-        const text = `NEXT · ${timedQueue.length} queued`;
-        const w = ctx.measureText(text).width + 20;
-        roundedRect(14, H - 34, w, 22, 6);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = 'hsl(210 20% 96%)';
-        ctx.fillText(text, 24, H - 20);
+        ctx.fillStyle = '#06b6d4';
+        ctx.font = 'bold 9px ui-sans-serif, system-ui';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`SHIELD ×${shieldLeft}`, W - 104, 55);
       }
 
       // Pause overlay
       if (pausedRef.current) {
-        ctx.fillStyle = 'hsl(222 47% 5% / 0.8)';
+        ctx.fillStyle = 'rgba(5,10,20,0.70)';
         ctx.fillRect(0, 0, W, H);
-        ctx.fillStyle = 'hsl(190 95% 50%)';
-        ctx.font = 'bold 44px ui-sans-serif, system-ui';
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = 'bold 28px ui-sans-serif, system-ui';
         ctx.textAlign = 'center';
-        ctx.fillText('PAUSED', W / 2, H / 2 - 10);
-        ctx.font = 'bold 13px ui-sans-serif, system-ui';
-        ctx.fillStyle = 'hsl(210 20% 96%)';
-        ctx.fillText('Open the shop to buy power-ups', W / 2, H / 2 + 18);
-        ctx.textAlign = 'start';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('PAUSED', W / 2, H / 2);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '13px ui-sans-serif, system-ui';
+        ctx.fillText('Buy power-ups below, then resume', W / 2, H / 2 + 28);
+      }
+
+      // Death overlay
+      if (!alive) {
+        ctx.fillStyle = 'rgba(5,10,20,0.75)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#ef4444';
+        ctx.font = 'bold 30px ui-sans-serif, system-ui';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('GAME OVER', W / 2, H / 2 - 14);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '14px ui-sans-serif, system-ui';
+        ctx.fillText(`Score: ${Math.floor(score)}`, W / 2, H / 2 + 18);
       }
     };
 
-    const loop = () => {
-      if (!pausedRef.current && gameActive) update();
-      draw();
-      if (gameActive) animId = requestAnimationFrame(loop);
+    const cleanup = () => {
+      canvas.removeEventListener('mousedown', onPointerDown);
+      canvas.removeEventListener('mouseup', onPointerUp);
+      canvas.removeEventListener('touchstart', onPointerDown);
+      canvas.removeEventListener('touchend', onPointerUp);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
     };
 
     animId = requestAnimationFrame(loop);
-
     return () => {
       cancelAnimationFrame(animId);
-      canvas.removeEventListener('mousedown', onDown);
-      canvas.removeEventListener('mouseup', onUp);
-      canvas.removeEventListener('touchstart', onDown);
-      canvas.removeEventListener('touchend', onUp);
-      window.removeEventListener('keydown', onKey);
-      window.removeEventListener('keyup', onKeyUp);
+      cleanup();
     };
-  }, [isPlaying, dimensions, playSound, onPause]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, dimensions.width, dimensions.height]);
 
   return (
-    <div className="relative w-full" style={{ maxWidth: dimensions.width }}>
+    <div className="relative w-full">
       <canvas
         ref={canvasRef}
         width={dimensions.width}
         height={dimensions.height}
-        className="neon-border w-full rounded-2xl bg-background cursor-pointer"
-        style={{ touchAction: 'none', display: 'block' }}
+        className="cursor-pointer touch-none rounded-2xl border border-primary/20 shadow-[0_0_40px_hsl(190_95%_50%/0.12)]"
+        aria-label="Jumparun game canvas — tap to jump"
+        role="img"
       />
-
-      <div className="pointer-events-none absolute right-3 top-3 flex gap-2">
-        <button
-          onClick={onHome}
-          className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-lg border border-primary/30 bg-surface-1/80 text-primary backdrop-blur-md transition-all hover:border-primary hover:bg-surface-2 active:scale-95"
-          aria-label="Home"
-        >
-          <Home className="h-4 w-4" />
-        </button>
+      {/* In-game controls overlay */}
+      <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-white/40">
+        <span>Tap</span>
+        <span className="opacity-50">/</span>
+        <span>Space to jump</span>
+      </div>
+      <div className="absolute right-3 top-3 flex gap-2">
         <button
           onClick={onPause}
-          className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-lg border border-primary/30 bg-surface-1/80 text-primary backdrop-blur-md transition-all hover:border-primary hover:bg-surface-2 active:scale-95"
-          aria-label={paused ? 'Resume' : 'Pause'}
+          className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-black/50 text-white/70 backdrop-blur transition hover:border-white/30 hover:text-white"
+          aria-label={paused ? 'Resume game' : 'Pause game'}
         >
-          {paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
+          {paused ? <Play className="h-3.5 w-3.5" fill="currentColor" /> : <Pause className="h-3.5 w-3.5" />}
+        </button>
+        <button
+          onClick={onHome}
+          className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-black/50 text-white/70 backdrop-blur transition hover:border-white/30 hover:text-white"
+          aria-label="Go to home screen"
+        >
+          <Home className="h-3.5 w-3.5" />
         </button>
       </div>
     </div>

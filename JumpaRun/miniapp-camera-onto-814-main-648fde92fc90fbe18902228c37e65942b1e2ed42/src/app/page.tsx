@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import dynamic from 'next/dynamic';
 import { ArrowLeftRight, Play, RotateCcw, Trophy, Home as HomeIcon, Zap } from 'lucide-react';
 import WalletButton from '@/components/WalletButton';
@@ -13,15 +13,11 @@ import {
   type PowerUpInventory,
 } from '@/lib/powerups';
 
+
 const Game2D = dynamic(() => import('@/components/Game2D'), { ssr: false });
 
-const JUMP_STORAGE = 'jumparun:jump';
 const INVENTORY_STORAGE = 'jumparun:inventory';
-const QUEUE_STORAGE = 'jumparun:queue';
 const HIGHSCORE_STORAGE = 'jumparun:highscore';
-
-/** Starter JUMP given to a brand-new player so they can sample a power-up. */
-const STARTER_JUMP = 1500;
 
 type View = 'home' | 'playing' | 'gameover';
 
@@ -30,56 +26,16 @@ export default function Home() {
   const [paused, setPaused] = useState(false);
   const [score, setScore] = useState(0);
   const [highScore, setHighScore] = useState(0);
-  const [jumpBank, setJumpBank] = useState(0);
   const [runJump, setRunJump] = useState(0);
   const [inventory, setInventory] = useState<PowerUpInventory>(EMPTY_INVENTORY);
-  const [queue, setQueue] = useState<PowerUpId[]>([]);
   const [swapOpen, setSwapOpen] = useState(false);
 
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(JUMP_STORAGE);
-      if (raw === null) {
-        // first-time player — give them a small starter balance
-        localStorage.setItem(JUMP_STORAGE, String(STARTER_JUMP));
-        setJumpBank(STARTER_JUMP);
-      } else {
-        const v = Number(raw);
-        if (!Number.isNaN(v)) setJumpBank(v);
-      }
       const hs = Number(localStorage.getItem(HIGHSCORE_STORAGE) ?? '0');
       if (!Number.isNaN(hs)) setHighScore(hs);
       const inv = localStorage.getItem(INVENTORY_STORAGE);
       if (inv) setInventory({ ...EMPTY_INVENTORY, ...JSON.parse(inv) });
-      const q = localStorage.getItem(QUEUE_STORAGE);
-      if (q) setQueue(JSON.parse(q));
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  const persistJump = useCallback((v: number) => {
-    setJumpBank(v);
-    try {
-      localStorage.setItem(JUMP_STORAGE, String(v));
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  const persistInventory = useCallback((inv: PowerUpInventory) => {
-    setInventory(inv);
-    try {
-      localStorage.setItem(INVENTORY_STORAGE, JSON.stringify(inv));
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  const persistQueue = useCallback((q: PowerUpId[]) => {
-    setQueue(q);
-    try {
-      localStorage.setItem(QUEUE_STORAGE, JSON.stringify(q));
     } catch {
       /* ignore */
     }
@@ -96,55 +52,37 @@ export default function Home() {
 
   const handleGameOver = useCallback(
     (finalScore: number, jumpFromRun: number) => {
-      persistJump(jumpBank + jumpFromRun);
+      setRunJump(jumpFromRun);
       if (finalScore > highScore) persistHighScore(finalScore);
-      // Clear inventory + queue — power-ups were consumed during the run
-      persistInventory(EMPTY_INVENTORY);
-      persistQueue([]);
+      // Clear inventory after each run — power-ups are consumed
+      setInventory(EMPTY_INVENTORY);
+      try { localStorage.setItem(INVENTORY_STORAGE, JSON.stringify(EMPTY_INVENTORY)); } catch { /* ignore */ }
       setView('gameover');
       setPaused(false);
     },
-    [jumpBank, highScore, persistJump, persistHighScore, persistInventory, persistQueue],
+    [highScore, persistHighScore],
   );
 
   const handleScoreUpdate = useCallback((s: number) => setScore(s), []);
   const handleJumpCollected = useCallback((total: number) => setRunJump(total), []);
 
-  // Called by the game when it consumes a power-up charge.
+  // Called by the game loop when it uses a passive power-up charge.
   const handleConsumePowerUp = useCallback((id: PowerUpId) => {
     setInventory((prev) => {
       const next = { ...prev, [id]: Math.max(0, prev[id] - 1) };
-      try {
-        localStorage.setItem(INVENTORY_STORAGE, JSON.stringify(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-    setQueue((prev) => {
-      const idx = prev.indexOf(id);
-      if (idx === -1) return prev;
-      const next = [...prev.slice(0, idx), ...prev.slice(idx + 1)];
-      try {
-        localStorage.setItem(QUEUE_STORAGE, JSON.stringify(next));
-      } catch {
-        /* ignore */
-      }
+      try { localStorage.setItem(INVENTORY_STORAGE, JSON.stringify(next)); } catch { /* ignore */ }
       return next;
     });
   }, []);
 
-  const buyPowerUp = useCallback(
-    (id: PowerUpId): boolean => {
-      const def = POWERUPS[id];
-      if (jumpBank < def.cost) return false;
-      persistJump(jumpBank - def.cost);
-      persistInventory({ ...inventory, [id]: inventory[id] + 1 });
-      persistQueue([...queue, id]);
-      return true;
-    },
-    [jumpBank, inventory, queue, persistJump, persistInventory, persistQueue],
-  );
+  // Called by PowerUpShop after on-chain tx confirms.
+  const handleGrantPowerUp = useCallback((id: PowerUpId) => {
+    setInventory((prev) => {
+      const next = { ...prev, [id]: prev[id] + 1 };
+      try { localStorage.setItem(INVENTORY_STORAGE, JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
 
   const startGame = useCallback(() => {
     setScore(0);
@@ -154,19 +92,10 @@ export default function Home() {
   }, []);
 
   const goHome = useCallback(() => {
-    if (runJump > 0) {
-      persistJump(jumpBank + runJump);
-      setRunJump(0);
-    }
     if (score > highScore) persistHighScore(score);
     setView('home');
     setPaused(false);
-  }, [runJump, jumpBank, persistJump, score, highScore, persistHighScore]);
-
-  const totalJumpDisplay = useMemo(
-    () => jumpBank + (view === 'playing' ? runJump : 0),
-    [jumpBank, runJump, view],
-  );
+  }, [score, highScore, persistHighScore]);
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-background text-foreground">
@@ -217,8 +146,8 @@ export default function Home() {
           />
           <StatChip
             icon={<JumpDot className="text-accent" />}
-            label="$JUMP"
-            value={totalJumpDisplay.toLocaleString()}
+            label="Earned"
+            value={runJump.toLocaleString()}
             accent="accent"
           />
           <StatChip
@@ -235,7 +164,6 @@ export default function Home() {
               isPlaying
               paused={paused}
               inventory={inventory}
-              queue={queue}
               onGameOver={handleGameOver}
               onScoreUpdate={handleScoreUpdate}
               onJumpCollected={handleJumpCollected}
@@ -266,9 +194,8 @@ export default function Home() {
                   </div>
                 </div>
                 <PowerUpShop
-                  balance={jumpBank}
                   inventory={inventory}
-                  onBuy={buyPowerUp}
+                  onGrantPowerUp={handleGrantPowerUp}
                 />
               </div>
             )}
@@ -305,7 +232,7 @@ export default function Home() {
 
                   <div className="grid grid-cols-2 gap-3">
                     <MiniStat label="$JUMP earned" value={runJump.toLocaleString()} />
-                    <MiniStat label="Bank total" value={jumpBank.toLocaleString()} />
+                    <MiniStat label="High score" value={highScore.toLocaleString()} />
                   </div>
 
                   <div className="flex flex-wrap gap-3">
@@ -369,20 +296,22 @@ export default function Home() {
                     </button>
                   </div>
 
-                  {queue.length > 0 && (
+                  {inventory && Object.values(inventory).some((v) => v > 0) && (
                     <div className="rounded-xl border border-primary/20 bg-surface-2 p-3">
                       <p className="mb-1.5 font-display text-[10px] font-bold uppercase tracking-wider text-primary">
-                        Queued for next run ({queue.length})
+                        Equipped for next run
                       </p>
                       <div className="flex flex-wrap gap-1.5">
-                        {queue.map((id, idx) => (
-                          <span
-                            key={idx}
-                            className="rounded-md border border-border bg-surface-3 px-2 py-0.5 font-display text-[10px] font-bold text-foreground"
-                          >
-                            {idx + 1}. {POWERUPS[id].short}
-                          </span>
-                        ))}
+                        {(Object.entries(inventory) as [PowerUpId, number][])
+                          .filter(([, qty]) => qty > 0)
+                          .map(([id, qty]) => (
+                            <span
+                              key={id}
+                              className="rounded-md border border-border bg-surface-3 px-2 py-0.5 font-display text-[10px] font-bold text-foreground"
+                            >
+                              {POWERUPS[id].short} ×{qty}
+                            </span>
+                          ))}
                       </div>
                     </div>
                   )}
@@ -425,9 +354,8 @@ export default function Home() {
 
               <div className="glass rounded-2xl p-5">
                 <PowerUpShop
-                  balance={jumpBank}
                   inventory={inventory}
-                  onBuy={buyPowerUp}
+                  onGrantPowerUp={handleGrantPowerUp}
                 />
               </div>
             </div>
