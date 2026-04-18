@@ -28,6 +28,9 @@ export const metadata: Metadata = {
     description: 'Endless runner on Base. Jump, dash, collect — and swap $JUMP.',
     type: 'website',
   },
+  other: {
+    'base:app_id': '6943dd0cd77c069a945bdffd',
+  },
 };
 
 export const viewport: Viewport = {
